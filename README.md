@@ -512,3 +512,602 @@ Consumer Python
 ```
 
 El `compose.yaml` continuará creciendo sobre esta misma base; no se crearán laboratorios aislados para cada tecnología.
+
+---
+---
+
+## Etapa 2 — Producer y Consumer Python
+
+Objetivo de esta etapa:
+
+* publicar eventos Kafka desde Python;
+* consumirlos desde Python;
+* verificar particiones y offsets;
+* comprobar consumer groups;
+* validar reparto de particiones entre múltiples consumers;
+* comprobar rebalance cuando un consumer se cae.
+
+---
+
+## 1. Estructura
+
+```text
+apps/
+├── producer/
+│   ├── Dockerfile
+│   ├── producer.py
+│   └── requirements.txt
+│
+└── consumer/
+    ├── Dockerfile
+    ├── consumer.py
+    └── requirements.txt
+```
+
+---
+
+## 2. Producer Python
+
+### `apps/producer/requirements.txt`
+
+```txt
+confluent-kafka==2.15.0
+```
+
+### `apps/producer/Dockerfile`
+
+```dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY producer.py .
+
+CMD ["python", "producer.py"]
+```
+
+### `apps/producer/producer.py`
+
+```python
+import json
+
+from confluent_kafka import Producer
+
+
+producer = Producer(
+    {
+        "bootstrap.servers": "kafka:19092",
+    }
+)
+
+personas = [
+    {"id": "P101", "nombre": "Carlos", "jurisdiccion": "ARG-B"},
+    {"id": "P102", "nombre": "Laura", "jurisdiccion": "ARG-B"},
+    {"id": "P103", "nombre": "Martin", "jurisdiccion": "ARG-B"},
+]
+
+
+def delivery_report(err, msg):
+    if err:
+        print(f"ERROR: {err}")
+        return
+
+    print(
+        f"OK key={msg.key().decode()} "
+        f"partition={msg.partition()} "
+        f"offset={msg.offset()}"
+    )
+
+
+for persona in personas:
+    producer.produce(
+        topic="bnh.personas",
+        key=persona["id"],
+        value=json.dumps(persona),
+        callback=delivery_report,
+    )
+
+producer.flush()
+```
+
+### Qué valida
+
+Cada persona se publica como un evento independiente en:
+
+```text
+bnh.personas
+```
+
+usando el ID como `key`.
+
+Ejemplo:
+
+```text
+P101 → Kafka
+P102 → Kafka
+P103 → Kafka
+```
+
+El producer usa:
+
+```text
+kafka:19092
+```
+
+porque corre dentro de la misma red Docker que Kafka.
+
+---
+
+## 3. Consumer Python
+
+### `apps/consumer/requirements.txt`
+
+```txt
+confluent-kafka==2.15.0
+```
+
+### `apps/consumer/Dockerfile`
+
+```dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY consumer.py .
+
+CMD ["python", "consumer.py"]
+```
+
+### `apps/consumer/consumer.py`
+
+```python
+import json
+
+from confluent_kafka import Consumer
+
+
+consumer = Consumer(
+    {
+        "bootstrap.servers": "kafka:19092",
+        "group.id": "bnh-personas-consumer",
+        "auto.offset.reset": "earliest",
+    }
+)
+
+consumer.subscribe(["bnh.personas"])
+
+print("Esperando eventos de bnh.personas...")
+
+try:
+    while True:
+        msg = consumer.poll(1.0)
+
+        if msg is None:
+            continue
+
+        if msg.error():
+            print(f"ERROR: {msg.error()}")
+            continue
+
+        persona = json.loads(msg.value().decode("utf-8"))
+
+        print(
+            f"key={msg.key().decode()} "
+            f"partition={msg.partition()} "
+            f"offset={msg.offset()} "
+            f"persona={persona}"
+        )
+
+finally:
+    consumer.close()
+```
+
+---
+
+## 4. Servicios en `compose.yaml`
+
+Agregar:
+
+```yaml
+  producer:
+    build:
+      context: ./apps/producer
+    container_name: bnh-producer
+    depends_on:
+      - kafka
+    restart: "no"
+
+  consumer:
+    build:
+      context: ./apps/consumer
+    container_name: bnh-consumer
+    depends_on:
+      - kafka
+    restart: "no"
+```
+
+---
+
+## 5. Validar Compose
+
+### Para qué
+
+Confirmar que los nuevos servicios están correctamente definidos.
+
+```bash
+docker compose config
+```
+
+### Resultado esperado
+
+Deben aparecer:
+
+```text
+producer
+consumer
+kafka
+```
+
+sin errores de configuración.
+
+---
+
+## 6. Construir producer
+
+```bash
+docker compose build producer
+```
+
+### Resultado esperado
+
+```text
+Image bnh-laboratory-producer Built
+```
+
+---
+
+## 7. Ejecutar producer
+
+```bash
+docker compose run --rm producer
+```
+
+### Resultado esperado
+
+Algo similar a:
+
+```text
+OK key=P103 partition=1 offset=2
+OK key=P102 partition=2 offset=2
+OK key=P101 partition=0 offset=2
+```
+
+Las particiones concretas dependen de la key y configuración actual.
+
+---
+
+## 8. Verificar mensajes desde Kafka
+
+```bash
+docker exec bnh-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic bnh.personas \
+  --from-beginning \
+  --formatter-property print.key=true \
+  --formatter-property print.partition=true \
+  --formatter-property print.offset=true
+```
+
+### Para qué
+
+Confirmar que los eventos producidos desde Python fueron persistidos correctamente por Kafka.
+
+---
+
+## 9. Construir consumer
+
+```bash
+docker compose build consumer
+```
+
+### Resultado esperado
+
+```text
+Image bnh-laboratory-consumer Built
+```
+
+---
+
+## 10. Ejecutar consumer
+
+```bash
+docker compose run --rm consumer
+```
+
+### Resultado esperado
+
+El consumer lee los eventos existentes y luego queda esperando nuevos mensajes.
+
+Ejemplo:
+
+```text
+Esperando eventos de bnh.personas...
+
+key=P001 partition=2 offset=0 persona={...}
+key=P004 partition=2 offset=1 persona={...}
+key=P102 partition=2 offset=2 persona={...}
+```
+
+No termina automáticamente.
+
+Salir con:
+
+```text
+Ctrl+C
+```
+
+---
+
+## 11. Probar consumo en vivo
+
+Dejar el consumer ejecutándose.
+
+En otra terminal:
+
+```bash
+docker compose run --rm producer
+```
+
+### Resultado esperado
+
+El producer publica nuevos eventos y el consumer los muestra automáticamente.
+
+Esto valida:
+
+```text
+Producer Python
+      ↓
+    Kafka
+      ↓
+Consumer Python
+```
+
+---
+
+## 12. Verificar Consumer Group
+
+Con el consumer todavía corriendo:
+
+```bash
+docker exec bnh-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --describe \
+  --group bnh-personas-consumer
+```
+
+### Resultado esperado
+
+Ejemplo:
+
+```text
+PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+0          4               4               0
+1          4               4               0
+2          4               4               0
+```
+
+### Interpretación
+
+`CURRENT-OFFSET`
+
+Posición hasta la que avanzó el consumer group.
+
+`LOG-END-OFFSET`
+
+Próxima posición disponible en la partición.
+
+`LAG`
+
+Cantidad de mensajes pendientes.
+
+Si:
+
+```text
+LAG = 0
+```
+
+el consumer está al día.
+
+---
+
+## 13. Probar múltiples consumers
+
+Mantener el primer consumer ejecutándose y abrir un segundo:
+
+```bash
+docker compose run --rm consumer
+```
+
+Ambos utilizan:
+
+```text
+group.id = bnh-personas-consumer
+```
+
+por lo tanto Kafka los considera parte del mismo consumer group.
+
+Volver a inspeccionar:
+
+```bash
+docker exec bnh-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --describe \
+  --group bnh-personas-consumer
+```
+
+### Resultado esperado
+
+Con 3 particiones y 2 consumers:
+
+```text
+Consumer A
+├── Partition 0
+└── Partition 1
+
+Consumer B
+└── Partition 2
+```
+
+La distribución concreta puede variar.
+
+---
+
+## 14. Probar paralelismo
+
+Con los dos consumers ejecutándose:
+
+```bash
+docker compose run --rm producer
+```
+
+En la prueba realizada:
+
+```text
+P101 → Partition 0
+P102 → Partition 2
+P103 → Partition 1
+```
+
+Por lo tanto:
+
+```text
+Consumer A
+├── P101
+└── P103
+
+Consumer B
+└── P102
+```
+
+Cada consumer procesa solamente las particiones que Kafka le asignó.
+
+---
+
+## 15. Probar rebalance por caída
+
+Detener uno de los consumers:
+
+```text
+Ctrl+C
+```
+
+Después:
+
+```bash
+docker exec bnh-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --describe \
+  --group bnh-personas-consumer
+```
+
+### Resultado esperado
+
+Kafka reasigna las particiones del consumer que desapareció al consumer que sigue activo.
+
+Ejemplo:
+
+Antes:
+
+```text
+Consumer A → Partition 0, 1
+Consumer B → Partition 2
+```
+
+Después:
+
+```text
+Consumer A → Partition 0, 1, 2
+```
+
+Esto confirma el rebalance automático del consumer group.
+
+---
+
+## Resultado de la etapa
+
+Quedó validado:
+
+```text
+Producer Python
+      ↓
+    Kafka
+      ↓
+Consumer Group Python
+      ├── particiones
+      ├── offsets
+      ├── lag
+      ├── paralelismo
+      └── rebalance
+```
+
+También quedó comprobado que eventos con la misma `key` mantienen la misma partición mientras se conserve la configuración actual de particiones.
+
+Ejemplo observado:
+
+```text
+P101 → Partition 0
+P102 → Partition 2
+P103 → Partition 1
+```
+
+al volver a publicar esas mismas keys.
+
+---
+
+## Detener el laboratorio
+
+Cerrar los consumers activos con:
+
+```text
+Ctrl+C
+```
+
+Después:
+
+```bash
+docker compose down
+```
+
+Esto elimina contenedores y red, pero mantiene el volumen Kafka.
+
+Para borrar también todos los datos:
+
+```bash
+docker compose down -v
+```
+
+Usar `-v` únicamente cuando se quiera reiniciar el laboratorio completamente.
+
+---
+
+## Siguiente etapa
+
+Reemplazar el producer fijo por una API Python:
+
+```text
+POST /personas
+      ↓
+API Python
+      ↓
+publica un evento Kafka por registro
+      ↓
+Kafka
+      ↓
+Consumer
+```

@@ -48,5 +48,25 @@ services:
     volumes:
       - kafka_data:/var/lib/kafka/data
 
+  producer:
+    build:
+      context: ./apps/producer
+    container_name: bnh-producer
+
+    depends_on:
+      - kafka
+
+    restart: "no"
+
+  consumer:
+    build:
+      context: ./apps/consumer
+    container_name: bnh-consumer
+
+    depends_on:
+      - kafka
+
+    restart: "no"
+
 volumes:
   kafka_data:
