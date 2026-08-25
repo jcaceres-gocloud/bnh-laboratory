@@ -1615,3 +1615,605 @@ Objetivo:
 * transformar registros;
 * publicar esos registros en `bnh.personas`;
 * comprobar que Kafka recibe datos tanto por API como por archivo.
+
+---
+---
+
+## Etapa 4 — Ingesta de archivos con Apache NiFi
+
+En esta etapa se incorporó **Apache NiFi 2.11.0** al laboratorio para validar un segundo canal de ingreso de datos hacia Kafka.
+
+Hasta esta etapa existían:
+
+- productor Python → Kafka;
+- consumer Python ← Kafka;
+- API REST → Kafka.
+
+Ahora se agregó:
+
+```text
+Archivo CSV
+    ↓
+Apache NiFi
+    ↓
+Kafka
+    ↓
+Consumer Python
+```
+
+El objetivo es simular la recepción de archivos de una jurisdicción y transformar cada registro recibido en un mensaje Kafka independiente.
+
+> Esta configuración corresponde al laboratorio local. No representa todavía el contrato definitivo de intercambio ni una configuración productiva de NiFi.
+
+---
+
+### 4.1 Servicio NiFi
+
+Se agregó al `compose.yaml`:
+
+```yaml
+nifi:
+  image: apache/nifi:2.11.0
+  container_name: bnh-nifi
+  hostname: nifi
+
+  depends_on:
+    - kafka
+
+  ports:
+    - "8443:8443"
+
+  environment:
+    SINGLE_USER_CREDENTIALS_USERNAME: admin
+    SINGLE_USER_CREDENTIALS_PASSWORD: BnhLaboratory1234
+
+  volumes:
+    - ./data/incoming:/data/incoming
+    - nifi_conf:/opt/nifi/nifi-current/conf
+    - nifi_state:/opt/nifi/nifi-current/state
+    - nifi_database:/opt/nifi/nifi-current/database_repository
+    - nifi_flowfile:/opt/nifi/nifi-current/flowfile_repository
+    - nifi_content:/opt/nifi/nifi-current/content_repository
+    - nifi_provenance:/opt/nifi/nifi-current/provenance_repository
+
+  restart: "no"
+```
+
+Y los siguientes volúmenes:
+
+```yaml
+volumes:
+  kafka_data:
+  nifi_conf:
+  nifi_state:
+  nifi_database:
+  nifi_flowfile:
+  nifi_content:
+  nifi_provenance:
+```
+
+Los volúmenes permiten conservar configuración, estado y repositories de NiFi entre recreaciones del contenedor.
+
+El directorio:
+
+```text
+./data/incoming
+```
+
+se monta como:
+
+```text
+/data/incoming
+```
+
+dentro del contenedor.
+
+Esto permite que los archivos generados desde el host sean visibles directamente por NiFi.
+
+---
+
+### 4.2 Inicio
+
+Levantar Kafka y NiFi:
+
+```bash
+docker compose up -d kafka nifi
+```
+
+La interfaz web queda disponible en:
+
+```text
+https://localhost:8443/nifi
+```
+
+El certificado es autofirmado, por lo que el navegador puede mostrar una advertencia.
+
+Credenciales del laboratorio:
+
+```text
+Usuario: admin
+Password: BnhLaboratory1234
+```
+
+Estas credenciales son únicamente para desarrollo local.
+
+---
+
+### 4.3 Landing de archivos
+
+Se creó la estructura:
+
+```text
+data/
+└── incoming/
+    └── personas/
+```
+
+Ejemplo de archivo de entrada:
+
+```csv
+id,nombre,jurisdiccion
+P401,Carolina,ARG-B
+P402,Diego,ARG-B
+P403,Florencia,ARG-B
+```
+
+Ubicación:
+
+```text
+data/incoming/personas/personas.csv
+```
+
+Dentro de NiFi el mismo archivo queda disponible en:
+
+```text
+/data/incoming/personas/personas.csv
+```
+
+---
+
+### 4.4 Flujo NiFi
+
+Se construyó manualmente el siguiente flujo:
+
+```text
+                         ┌─────────────┐
+                    ┌───→│  LogErrors  │
+                    │    └─────────────┘
+                    │
+GetFile
+   │ success
+   ▼
+SplitRecord
+   │ splits
+   ▼
+EvaluateJsonPath
+   │ matched
+   ▼
+PublishKafka
+   │
+   ▼
+Kafka: bnh.personas
+```
+
+Las relaciones `failure` de los processors principales se envían a `LogErrors`.
+
+---
+
+### 4.5 GetFile
+
+Processor:
+
+```text
+GetFile
+```
+
+Configuración:
+
+```text
+Input Directory: /data/incoming/personas
+Recurse Subdirectories: false
+Keep Source File: false
+```
+
+Su función es detectar archivos en la landing y convertirlos en FlowFiles de NiFi.
+
+Con `Keep Source File = false`, el archivo se elimina de la landing una vez incorporado correctamente al flujo de NiFi.
+
+---
+
+### 4.6 SplitRecord
+
+Processor:
+
+```text
+SplitRecord
+```
+
+Se configuró para convertir un archivo CSV con múltiples registros en un FlowFile independiente por registro.
+
+Controller Services utilizados:
+
+```text
+CSVReader
+JsonRecordSetWriter
+```
+
+#### CSVReader
+
+Configuración principal:
+
+```text
+Schema Access Strategy:
+Use String Fields From Header
+```
+
+La primera fila del CSV se interpreta como encabezado y todos los campos se manejan inicialmente como strings.
+
+#### JsonRecordSetWriter
+
+Configuración:
+
+```text
+Schema Access Strategy:
+Inherit Record Schema
+
+Output Grouping:
+One Line Per Object
+
+Pretty Print JSON:
+false
+```
+
+#### SplitRecord
+
+Configuración:
+
+```text
+Record Reader: CSVReader
+Record Writer: JsonRecordSetWriter
+Records Per Split: 1
+```
+
+De esta forma:
+
+```text
+personas.csv
+    │
+    ▼
+SplitRecord
+    ├── P401
+    ├── P402
+    └── P403
+```
+
+Cada persona continúa por el pipeline como un FlowFile independiente.
+
+Relaciones:
+
+```text
+splits   → EvaluateJsonPath
+failure  → LogErrors
+original → terminate
+```
+
+---
+
+### 4.7 EvaluateJsonPath
+
+Processor:
+
+```text
+EvaluateJsonPath
+```
+
+Su función es obtener del JSON los campos necesarios para construir la key del mensaje Kafka.
+
+Configuración:
+
+```text
+Destination:
+flowfile-attribute
+```
+
+Propiedades dinámicas:
+
+```text
+persona.id
+$.id
+```
+
+```text
+persona.jurisdiccion
+$.jurisdiccion
+```
+
+Ejemplo:
+
+Contenido del FlowFile:
+
+```json
+{"id":"P401","nombre":"Carolina","jurisdiccion":"ARG-B"}
+```
+
+Atributos generados:
+
+```text
+persona.id = P401
+persona.jurisdiccion = ARG-B
+```
+
+Relaciones:
+
+```text
+matched → PublishKafka
+failure → LogErrors
+```
+
+---
+
+### 4.8 Kafka3ConnectionService
+
+Para que NiFi pueda publicar en Kafka se creó:
+
+```text
+Kafka3ConnectionService
+```
+
+Configuración:
+
+```text
+Bootstrap Servers:
+kafka:19092
+
+Security Protocol:
+PLAINTEXT
+```
+
+Se utiliza `kafka:19092` porque NiFi y Kafka se encuentran dentro de la misma red Docker Compose.
+
+El listener:
+
+```text
+localhost:9092
+```
+
+queda reservado para clientes que ejecutan desde el host.
+
+---
+
+### 4.9 PublishKafka
+
+Processor:
+
+```text
+PublishKafka
+```
+
+Configuración:
+
+```text
+Kafka Connection Service:
+Kafka3ConnectionService
+
+Topic Name:
+bnh.personas
+```
+
+Key Kafka:
+
+```text
+${persona.jurisdiccion}:${persona.id}
+```
+
+Ejemplo:
+
+```text
+ARG-B:P401
+```
+
+Esto mantiene el mismo criterio de key utilizado anteriormente por los productores Python.
+
+Relaciones:
+
+```text
+success → terminate
+failure → LogErrors
+```
+
+---
+
+### 4.10 LogErrors
+
+Processor:
+
+```text
+LogAttribute
+```
+
+Nombre utilizado en el flujo:
+
+```text
+LogErrors
+```
+
+Recibe los FlowFiles enviados por las relaciones `failure`.
+
+Flujos de error:
+
+```text
+SplitRecord.failure ────────┐
+                            │
+EvaluateJsonPath.failure ───┼──→ LogErrors
+                            │
+PublishKafka.failure ───────┘
+```
+
+La relación:
+
+```text
+success
+```
+
+de `LogErrors` se encuentra configurada como `terminate`.
+
+---
+
+### 4.11 Prueba end-to-end
+
+Se dejó un consumer Python escuchando el topic:
+
+```bash
+docker compose run --rm consumer
+```
+
+Salida inicial:
+
+```text
+Esperando eventos de bnh.personas...
+```
+
+Luego se creó:
+
+```bash
+cat > data/incoming/personas/personas.csv <<'EOF'
+id,nombre,jurisdiccion
+P401,Carolina,ARG-B
+P402,Diego,ARG-B
+P403,Florencia,ARG-B
+EOF
+```
+
+NiFi detectó automáticamente el archivo y ejecutó:
+
+```text
+CSV
+ ↓
+GetFile
+ ↓
+SplitRecord
+ ↓
+EvaluateJsonPath
+ ↓
+PublishKafka
+ ↓
+Kafka
+ ↓
+Consumer Python
+```
+
+Resultado observado:
+
+```text
+key=ARG-B:P402 partition=0 offset=10 persona={'id': 'P402', 'nombre': 'Diego', 'jurisdiccion': 'ARG-B'}
+
+key=ARG-B:P401 partition=1 offset=8 persona={'id': 'P401', 'nombre': 'Carolina', 'jurisdiccion': 'ARG-B'}
+
+key=ARG-B:P403 partition=1 offset=9 persona={'id': 'P403', 'nombre': 'Florencia', 'jurisdiccion': 'ARG-B'}
+```
+
+Con esto quedó validado:
+
+```text
+Archivo CSV
+    ↓
+NiFi
+    ↓
+Kafka
+    ↓
+Consumer Python
+```
+
+con **un mensaje Kafka por persona** y una key formada por:
+
+```text
+jurisdiccion:id_persona
+```
+
+---
+
+### 4.12 Consumer groups durante la prueba
+
+Durante la primera ejecución había dos consumers activos utilizando:
+
+```text
+group.id = bnh-personas-consumer
+```
+
+Kafka repartió las particiones entre ambos consumers, por lo que la terminal utilizada para la prueba no mostraba todos los mensajes.
+
+Se verificó mediante:
+
+```bash
+docker exec bnh-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --describe \
+  --group bnh-personas-consumer
+```
+
+Luego de dejar un único consumer activo, este tomó las tres particiones:
+
+```text
+partition 0 → consumer
+partition 1 → consumer
+partition 2 → consumer
+```
+
+con:
+
+```text
+LAG = 0
+```
+
+Esto confirmó también el comportamiento de rebalanceo de Kafka Consumer Groups validado en etapas anteriores.
+
+---
+
+### 4.13 Estado de la etapa
+
+Validado:
+
+```text
+CSV → NiFi → Kafka → Consumer
+```
+
+También se comprobó:
+
+- lectura de archivos desde una landing compartida;
+- separación de un archivo en registros independientes;
+- transformación CSV → JSON;
+- extracción de atributos desde JSON;
+- generación de Kafka keys;
+- publicación en `bnh.personas`;
+- distribución por particiones;
+- manejo básico de ramas de error;
+- persistencia local de NiFi mediante Docker volumes.
+
+### Pendiente
+
+El flujo NiFi fue creado actualmente desde la interfaz web y está persistido en los volúmenes Docker locales.
+
+Esto significa que todavía **no es reproducible solamente clonando el repositorio**.
+
+Próximo paso:
+
+```text
+Agrupar flujo NiFi
+        ↓
+Exportar definición
+        ↓
+Versionar en Git
+        ↓
+Importar desde otro entorno
+```
+
+Estructura prevista:
+
+```text
+nifi/
+└── flows/
+    └── personas-file-ingestion.json
+```
+
+Esto permitirá que otro integrante del equipo pueda clonar el laboratorio y reconstruir el flujo sin configurarlo manualmente desde cero.
+
