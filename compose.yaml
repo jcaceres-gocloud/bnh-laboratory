@@ -68,5 +68,18 @@ services:
 
     restart: "no"
 
+  api:
+    build:
+      context: ./apps/api
+    container_name: bnh-api
+
+    depends_on:
+      - kafka
+
+    ports:
+      - "8000:8000"
+
+    restart: "no"
+
 volumes:
   kafka_data:

@@ -1111,3 +1111,507 @@ Kafka
       ↓
 Consumer
 ```
+
+---
+---
+## Etapa 3 — API REST → Kafka
+
+Objetivo de esta etapa:
+
+* reemplazar el producer de prueba por una API HTTP;
+* recibir un lote JSON;
+* publicar un evento Kafka por cada registro;
+* conservar metadata del lote;
+* validar el flujo completo usando el consumer Python existente.
+
+Flujo validado:
+
+```text
+Cliente HTTP
+     ↓
+API Python
+     ↓
+Kafka
+     ↓
+Consumer Python
+```
+
+---
+
+## 1. Estructura
+
+Agregar:
+
+```text
+apps/
+├── api/
+│   ├── Dockerfile
+│   ├── api.py
+│   └── requirements.txt
+│
+├── producer/
+└── consumer/
+```
+
+---
+
+## 2. API Python
+
+### `apps/api/requirements.txt`
+
+```txt
+fastapi
+uvicorn[standard]
+confluent-kafka==2.15.0
+```
+
+### `apps/api/Dockerfile`
+
+```dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY api.py .
+
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+### `apps/api/api.py`
+
+```python
+import json
+
+from confluent_kafka import Producer
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+
+app = FastAPI(title="BNH Laboratory API")
+
+
+producer = Producer(
+    {
+        "bootstrap.servers": "kafka:19092",
+    }
+)
+
+
+class Metadata(BaseModel):
+    jurisdiccion: str
+    dominio: str
+    lote_id: str
+
+
+class Persona(BaseModel):
+    id: str
+    nombre: str
+
+
+class PersonasPayload(BaseModel):
+    metadata: Metadata
+    registros: list[Persona]
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/personas", status_code=202)
+def crear_personas(payload: PersonasPayload):
+    for persona in payload.registros:
+        evento = {
+            "metadata": payload.metadata.model_dump(),
+            "registro": persona.model_dump(),
+        }
+
+        key = f"{payload.metadata.jurisdiccion}:{persona.id}"
+
+        producer.produce(
+            topic="bnh.personas",
+            key=key,
+            value=json.dumps(evento),
+        )
+
+    producer.flush()
+
+    return {
+        "status": "accepted",
+        "lote_id": payload.metadata.lote_id,
+        "cantidad_registros": len(payload.registros),
+    }
+```
+
+### Qué hace
+
+La API recibe un lote:
+
+```text
+1 request REST
+    ↓
+3 personas
+```
+
+y publica:
+
+```text
+3 eventos Kafka
+```
+
+Ejemplo:
+
+```text
+ARG-B:P201 → evento 1
+ARG-B:P202 → evento 2
+ARG-B:P203 → evento 3
+```
+
+La `key` utilizada es:
+
+```text
+jurisdiccion:id_persona
+```
+
+por ejemplo:
+
+```text
+ARG-B:P201
+```
+
+---
+
+## 3. Agregar API al `compose.yaml`
+
+Dentro de `services:`:
+
+```yaml
+  api:
+    build:
+      context: ./apps/api
+    container_name: bnh-api
+    depends_on:
+      - kafka
+    ports:
+      - "8000:8000"
+    restart: "no"
+```
+
+La API se comunica con Kafka mediante:
+
+```text
+kafka:19092
+```
+
+y queda expuesta al host mediante:
+
+```text
+localhost:8000
+```
+
+---
+
+## 4. Validar Compose
+
+### Para qué
+
+Confirmar que el servicio API fue agregado correctamente.
+
+### Comando
+
+```bash
+docker compose config
+```
+
+### Resultado esperado
+
+Deben aparecer:
+
+```text
+api
+consumer
+producer
+kafka
+```
+
+sin errores de configuración.
+
+---
+
+## 5. Construir la API
+
+### Comando
+
+```bash
+docker compose build api
+```
+
+### Resultado esperado
+
+Algo similar a:
+
+```text
+Image bnh-laboratory-api Built
+```
+
+---
+
+## 6. Levantar Kafka + API
+
+### Comando
+
+```bash
+docker compose up -d kafka api
+```
+
+### Verificar
+
+```bash
+docker ps
+```
+
+### Resultado esperado
+
+Deben aparecer:
+
+```text
+bnh-kafka
+bnh-api
+```
+
+con estado:
+
+```text
+Up
+```
+
+La API debe exponer:
+
+```text
+0.0.0.0:8000->8000/tcp
+```
+
+---
+
+## 7. Validar `/health`
+
+### Para qué
+
+Comprobar que la API HTTP está operativa antes de probar Kafka.
+
+### Comando
+
+```bash
+curl http://localhost:8000/health
+```
+
+### Resultado esperado
+
+```json
+{"status":"ok"}
+```
+
+---
+
+## 8. Levantar consumer
+
+En otra terminal:
+
+```bash
+docker compose run --rm consumer
+```
+
+### Resultado esperado
+
+Debe quedar escuchando:
+
+```text
+Esperando eventos de bnh.personas...
+```
+
+Puede mostrar eventos anteriores almacenados en Kafka.
+
+Dejarlo corriendo.
+
+---
+
+## 9. Enviar lote de Personas por REST
+
+En otra terminal:
+
+```bash
+curl -X POST http://localhost:8000/personas \
+  -H "Content-Type: application/json" \
+  -d '{
+    "metadata": {
+      "jurisdiccion": "ARG-B",
+      "dominio": "persona",
+      "lote_id": "L-REST-001"
+    },
+    "registros": [
+      {
+        "id": "P201",
+        "nombre": "Julieta"
+      },
+      {
+        "id": "P202",
+        "nombre": "Nicolas"
+      },
+      {
+        "id": "P203",
+        "nombre": "Valentina"
+      }
+    ]
+  }'
+```
+
+---
+
+## 10. Resultado esperado de la API
+
+```json
+{
+  "status": "accepted",
+  "lote_id": "L-REST-001",
+  "cantidad_registros": 3
+}
+```
+
+Esto confirma que la API recibió un único lote con tres registros.
+
+---
+
+## 11. Resultado esperado en Kafka
+
+El consumer debe recibir tres eventos independientes.
+
+Ejemplo conceptual:
+
+```text
+key=ARG-B:P201 ... persona={...}
+key=ARG-B:P202 ... persona={...}
+key=ARG-B:P203 ... persona={...}
+```
+
+Cada registro del request REST se convierte en un mensaje Kafka independiente.
+
+Flujo:
+
+```text
+POST /personas
+
+L-REST-001
+├── P201
+├── P202
+└── P203
+
+        ↓
+
+API
+
+        ↓
+
+Kafka
+
+├── evento ARG-B:P201
+├── evento ARG-B:P202
+└── evento ARG-B:P203
+```
+
+---
+
+## 12. Metadata conservada
+
+Cada evento enviado a Kafka contiene:
+
+```json
+{
+  "metadata": {
+    "jurisdiccion": "ARG-B",
+    "dominio": "persona",
+    "lote_id": "L-REST-001"
+  },
+  "registro": {
+    "id": "P201",
+    "nombre": "Julieta"
+  }
+}
+```
+
+De esta forma cada registro conserva trazabilidad respecto del lote HTTP original.
+
+---
+
+## Resultado de la etapa
+
+Quedó validado:
+
+```text
+Cliente REST
+     ↓
+API Python
+     ↓
+1 lote JSON
+     ↓
+N eventos Kafka
+     ↓
+Consumer Python
+```
+
+También quedó comprobado que:
+
+* la API puede comunicarse con Kafka por la red interna Docker;
+* un request puede generar varios eventos;
+* cada registro puede tener su propia key;
+* los datos mantienen metadata del lote;
+* el consumer recibe los eventos en tiempo real.
+
+---
+
+## Detener la etapa
+
+Cerrar el consumer:
+
+```text
+Ctrl+C
+```
+
+Luego:
+
+```bash
+docker compose down
+```
+
+Esto mantiene el volumen Kafka.
+
+Para eliminar también los datos:
+
+```bash
+docker compose down -v
+```
+
+---
+
+## Siguiente etapa
+
+Agregar Apache NiFi como segundo mecanismo de ingesta:
+
+```text
+API REST ───────────────┐
+                        ▼
+                       Kafka
+                        ▲
+CSV / archivo → NiFi ───┘
+```
+
+Objetivo:
+
+* levantar NiFi;
+* validar acceso a su UI;
+* procesar un CSV;
+* transformar registros;
+* publicar esos registros en `bnh.personas`;
+* comprobar que Kafka recibe datos tanto por API como por archivo.
