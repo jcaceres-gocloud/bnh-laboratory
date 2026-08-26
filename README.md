@@ -2217,3 +2217,597 @@ nifi/
 
 Esto permitirá que otro integrante del equipo pueda clonar el laboratorio y reconstruir el flujo sin configurarlo manualmente desde cero.
 
+---
+---
+
+## Etapa 5 — Ingesta gRPC con client streaming
+
+En esta etapa se incorporó **gRPC** como segundo contrato público de integración programática de BNH.
+
+La decisión funcional es que **REST y gRPC coexistirán como contratos públicos**. gRPC no reemplaza REST.
+
+El objetivo del laboratorio es validar este flujo:
+
+```text
+Cliente gRPC
+    │
+    │ client streaming
+    ▼
+Servidor gRPC Python
+    │
+    ▼
+Kafka
+    │
+    ▼
+bnh.personas
+```
+
+El canal de archivos con NiFi continúa siendo independiente:
+
+```text
+REST ─────┐
+          │
+gRPC ─────┼──→ Kafka
+          │
+NiFi ─────┘
+```
+
+> El contrato utilizado en esta etapa es simplificado y corresponde al laboratorio. No representa todavía el contrato definitivo de Personas de BNH.
+
+---
+
+### 5.1 Estructura
+
+Se agregó la siguiente estructura:
+
+```text
+contracts/
+└── grpc/
+    └── personas/
+        └── v1/
+            └── personas.proto
+
+apps/
+└── grpc/
+    ├── generated/
+    │   └── personas/
+    │       └── v1/
+    │           ├── personas_pb2.py
+    │           └── personas_pb2_grpc.py
+    ├── client/
+    │   ├── client.py
+    │   ├── Dockerfile
+    │   └── requirements.txt
+    └── server/
+        ├── server.py
+        ├── Dockerfile
+        └── requirements.txt
+```
+
+---
+
+### 5.2 Contrato Protobuf
+
+Archivo:
+
+```text
+contracts/grpc/personas/v1/personas.proto
+```
+
+Contenido:
+
+```protobuf
+syntax = "proto3";
+
+package bnh.personas.v1;
+
+
+message Metadata {
+  string jurisdiccion = 1;
+  string dominio = 2;
+  string lote_id = 3;
+}
+
+
+message Persona {
+  string id = 1;
+  string nombre = 2;
+}
+
+
+message CargaPersonaRequest {
+  Metadata metadata = 1;
+  Persona registro = 2;
+}
+
+
+message ResultadoCarga {
+  string lote_id = 1;
+  int32 cantidad_recibida = 2;
+  string estado = 3;
+}
+
+
+service PersonasService {
+  rpc EnviarPersonas(stream CargaPersonaRequest) returns (ResultadoCarga);
+}
+```
+
+El método:
+
+```protobuf
+rpc EnviarPersonas(stream CargaPersonaRequest) returns (ResultadoCarga);
+```
+
+implementa un RPC de tipo **client streaming**:
+
+```text
+Cliente
+  ├── request 1 ──→
+  ├── request 2 ──→
+  ├── request 3 ──→
+  └── request N ──→
+
+Cliente ←── una única respuesta final
+```
+
+Esto permite enviar múltiples registros utilizando un único stream gRPC.
+
+---
+
+### 5.3 Generación de código Python
+
+El archivo `.proto` se compila utilizando `grpcio-tools`.
+
+Para evitar instalar herramientas directamente en el host se utilizó Docker:
+
+```bash
+docker run --rm \
+  -v "$PWD:/workspace" \
+  -w /workspace \
+  python:3.12-slim \
+  sh -c "pip install --no-cache-dir grpcio-tools==1.83.0 && \
+  python -m grpc_tools.protoc \
+    -I contracts/grpc \
+    --python_out=apps/grpc/generated \
+    --grpc_python_out=apps/grpc/generated \
+    contracts/grpc/personas/v1/personas.proto"
+```
+
+Esto genera:
+
+```text
+personas_pb2.py
+personas_pb2_grpc.py
+```
+
+`personas_pb2.py` contiene las clases correspondientes a los mensajes Protobuf.
+
+`personas_pb2_grpc.py` contiene las clases necesarias para cliente y servidor gRPC:
+
+```text
+PersonasServiceStub
+PersonasServiceServicer
+add_PersonasServiceServicer_to_server
+```
+
+El código generado no debe editarse manualmente.
+
+---
+
+### 5.4 Dependencias
+
+Servidor:
+
+```text
+grpcio==1.83.0
+protobuf==7.35.1
+confluent-kafka==2.15.0
+```
+
+Cliente:
+
+```text
+grpcio==1.83.0
+protobuf==7.35.1
+```
+
+`grpcio-tools` se utiliza únicamente para generar código desde el `.proto` y no forma parte del runtime.
+
+---
+
+### 5.5 Servidor gRPC
+
+El servidor implementa:
+
+```python
+class PersonasService(
+    personas_pb2_grpc.PersonasServiceServicer
+):
+```
+
+El método:
+
+```python
+def EnviarPersonas(self, request_iterator, context):
+```
+
+recibe un iterador de mensajes provenientes del stream.
+
+Conceptualmente:
+
+```text
+request_iterator
+    │
+    ├── CargaPersonaRequest P501
+    ├── CargaPersonaRequest P502
+    └── CargaPersonaRequest P503
+```
+
+El servidor recorre los mensajes a medida que llegan:
+
+```python
+for request in request_iterator:
+    ...
+```
+
+y no necesita recibir el lote completo antes de empezar a procesarlo.
+
+---
+
+### 5.6 Integración con Kafka
+
+Por cada registro recibido por gRPC, el servidor genera un mensaje independiente en:
+
+```text
+bnh.personas
+```
+
+La Kafka key sigue el mismo criterio utilizado por REST y NiFi:
+
+```text
+jurisdiccion:id
+```
+
+Ejemplo:
+
+```text
+ARG-B:P501
+```
+
+El evento publicado tiene la forma:
+
+```json
+{
+  "metadata": {
+    "jurisdiccion": "ARG-B",
+    "dominio": "persona",
+    "lote_id": "L-GRPC-001"
+  },
+  "registro": {
+    "id": "P501",
+    "nombre": "Lucia"
+  }
+}
+```
+
+El producer utiliza el listener interno de Kafka:
+
+```text
+kafka:19092
+```
+
+porque ambos servicios se encuentran dentro de la red Docker Compose.
+
+---
+
+### 5.7 Respuesta gRPC
+
+Una vez finalizado el stream y publicados los mensajes en Kafka, el servidor responde:
+
+```text
+ResultadoCarga
+```
+
+Ejemplo:
+
+```text
+lote_id=L-GRPC-001
+cantidad_recibida=3
+estado=RECIBIDO
+```
+
+Para esta etapa del laboratorio se utiliza:
+
+```python
+producer.flush(10)
+```
+
+antes de devolver la respuesta.
+
+Esto permite validar que el lote fue enviado hacia Kafka antes de responder al cliente.
+
+> Este mecanismo deberá revisarse para pruebas de volumen y para un diseño productivo. El comportamiento de backpressure, acknowledgements parciales, reintentos y errores de streams largos todavía no está definido.
+
+---
+
+### 5.8 Cliente gRPC
+
+El cliente genera mensajes mediante un generador Python:
+
+```python
+def generar_personas():
+    ...
+    yield personas_pb2.CargaPersonaRequest(...)
+```
+
+El uso de `yield` permite entregar mensajes progresivamente al stream en vez de crear necesariamente todo el lote en memoria.
+
+La llamada gRPC se realiza mediante el Stub generado:
+
+```python
+stub = personas_pb2_grpc.PersonasServiceStub(channel)
+
+resultado = stub.EnviarPersonas(
+    generar_personas()
+)
+```
+
+En Docker el cliente se conecta mediante:
+
+```text
+grpc-server:50051
+```
+
+---
+
+### 5.9 Servicios Docker
+
+Servidor:
+
+```yaml
+grpc-server:
+  build:
+    context: ./apps/grpc
+    dockerfile: server/Dockerfile
+  container_name: bnh-grpc-server
+  hostname: grpc-server
+
+  depends_on:
+    kafka:
+      condition: service_healthy
+
+  ports:
+    - "50051:50051"
+
+  restart: "no"
+```
+
+Cliente:
+
+```yaml
+grpc-client:
+  build:
+    context: ./apps/grpc
+    dockerfile: client/Dockerfile
+  container_name: bnh-grpc-client
+
+  depends_on:
+    - grpc-server
+
+  restart: "no"
+```
+
+---
+
+### 5.10 Healthcheck de Kafka
+
+Durante la primera integración se detectó una condición de carrera:
+
+```text
+Kafka container started
+    ↓
+grpc-server started
+    ↓
+Kafka todavía no aceptaba conexiones
+    ↓
+Connection refused
+```
+
+`depends_on` con `service_started` garantiza que el contenedor haya arrancado, pero no que Kafka esté listo para aceptar conexiones.
+
+Se agregó un healthcheck:
+
+```yaml
+healthcheck:
+  test:
+    [
+      "CMD-SHELL",
+      "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 || exit 1",
+    ]
+  interval: 5s
+  timeout: 5s
+  retries: 12
+  start_period: 10s
+```
+
+Y el servidor gRPC utiliza:
+
+```yaml
+depends_on:
+  kafka:
+    condition: service_healthy
+```
+
+El arranque queda:
+
+```text
+Kafka inicia
+    ↓
+healthcheck OK
+    ↓
+Kafka Healthy
+    ↓
+grpc-server inicia
+```
+
+La prueba en frío confirmó:
+
+```text
+Container bnh-kafka       Healthy
+Container bnh-grpc-server Started
+```
+
+---
+
+### 5.11 Prueba gRPC aislada
+
+Primero se validó gRPC sin Kafka.
+
+El cliente envió:
+
+```text
+P501 - Lucia
+P502 - Mateo
+P503 - Camila
+```
+
+por un único stream.
+
+El servidor recibió individualmente:
+
+```text
+Recibida persona id=P501 nombre=Lucia jurisdiccion=ARG-B lote_id=L-GRPC-001
+Recibida persona id=P502 nombre=Mateo jurisdiccion=ARG-B lote_id=L-GRPC-001
+Recibida persona id=P503 nombre=Camila jurisdiccion=ARG-B lote_id=L-GRPC-001
+```
+
+El cliente recibió:
+
+```text
+lote_id=L-GRPC-001 cantidad_recibida=3 estado=RECIBIDO
+```
+
+Con esto se validó:
+
+```text
+grpc-client
+    ↓
+client streaming
+    ↓
+grpc-server
+    ↓
+ResultadoCarga
+```
+
+---
+
+### 5.12 Prueba end-to-end gRPC → Kafka
+
+Se dejó un consumer escuchando:
+
+```bash
+docker compose run --rm consumer
+```
+
+Luego se ejecutó:
+
+```bash
+docker compose run --rm grpc-client
+```
+
+El consumer recibió:
+
+```text
+key=ARG-B:P501 partition=2 offset=9
+persona={
+  'metadata': {
+    'jurisdiccion': 'ARG-B',
+    'dominio': 'persona',
+    'lote_id': 'L-GRPC-001'
+  },
+  'registro': {
+    'id': 'P501',
+    'nombre': 'Lucia'
+  }
+}
+```
+
+```text
+key=ARG-B:P502 partition=1 offset=12
+```
+
+```text
+key=ARG-B:P503 partition=1 offset=13
+```
+
+Con esto quedó validado:
+
+```text
+gRPC client
+     ↓
+gRPC server
+     ↓
+Kafka
+     ↓
+bnh.personas
+     ↓
+Consumer Python
+```
+
+Cada persona se publica como un mensaje Kafka independiente.
+
+---
+
+### 5.13 Estado de la etapa
+
+Validado:
+
+```text
+REST ─────┐
+          │
+gRPC ─────┼──→ Kafka
+          │
+NiFi ─────┘
+```
+
+La integración gRPC funciona utilizando:
+
+```text
+Protocol Buffers
+HTTP/2 / gRPC
+client streaming
+Python
+Kafka
+```
+
+El contrato gRPC y el contrato REST coexistirán como interfaces públicas de BNH.
+
+---
+
+### 5.14 Pendiente — pruebas de volumen
+
+Antes de continuar con Flink se realizarán pruebas de carga gRPC con:
+
+```text
+10 registros
+1.000 registros
+10.000 registros
+100.000 registros
+```
+
+Para evitar distorsionar las mediciones se eliminarán previamente los logs por registro.
+
+Las pruebas deberán registrar al menos:
+
+```text
+cantidad enviada
+cantidad recibida
+tiempo total
+registros por segundo
+errores
+```
+
+Luego se podrá repetir una prueba equivalente mediante REST para disponer de una comparación utilizando el mismo backend Kafka.
+
+Estas pruebas son de laboratorio y no constituyen todavía un benchmark productivo.

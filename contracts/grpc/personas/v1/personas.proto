@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package bnh.personas.v1;
+
+
+message Metadata {
+  string jurisdiccion = 1;
+  string dominio = 2;
+  string lote_id = 3;
+}
+
+
+message Persona {
+  string id = 1;
+  string nombre = 2;
+}
+
+
+message CargaPersonaRequest {
+  Metadata metadata = 1;
+  Persona registro = 2;
+}
+
+
+message ResultadoCarga {
+  string lote_id = 1;
+  int32 cantidad_recibida = 2;
+  string estado = 3;
+}
+
+
+service PersonasService {
+  rpc EnviarPersonas(stream CargaPersonaRequest) returns (ResultadoCarga);
+}
