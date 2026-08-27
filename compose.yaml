@@ -65,7 +65,8 @@ services:
     container_name: bnh-producer
 
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
 
     restart: "no"
 
@@ -75,7 +76,8 @@ services:
     container_name: bnh-consumer
 
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
 
     restart: "no"
 
@@ -85,7 +87,8 @@ services:
     container_name: bnh-api
 
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
 
     ports:
       - "8000:8000"
@@ -98,7 +101,8 @@ services:
     hostname: nifi
 
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
 
     ports:
       - "8443:8443"
@@ -131,6 +135,7 @@ services:
 
     ports:
       - "50051:50051"
+      - "8001:8001"
 
     restart: "no"
 
@@ -143,6 +148,76 @@ services:
     depends_on:
       - grpc-server
 
+    environment:
+      TOTAL_PERSONAS: ${TOTAL_PERSONAS:-10}
+
+    restart: "no"
+
+  prometheus:
+    image: prom/prometheus:v3.13.2
+    container_name: bnh-prometheus
+    depends_on:
+      grpc-server:
+        condition: service_started
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    restart: "no"
+
+  grafana:
+    image: grafana/grafana:13.2.0
+    container_name: bnh-grafana
+    depends_on:
+      prometheus:
+        condition: service_started
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    restart: "no"
+
+  flink-jobmanager:
+    build:
+      context: ./apps/flink
+      dockerfile: Dockerfile
+    image: bnh-flink:2.1.1
+    container_name: bnh-flink-jobmanager
+    hostname: flink-jobmanager
+    command: jobmanager
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./apps/flink/jobs:/opt/flink/jobs:ro
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+    restart: "no"
+
+  flink-taskmanager:
+    build:
+      context: ./apps/flink
+      dockerfile: Dockerfile
+    image: bnh-flink:2.1.1
+    container_name: bnh-flink-taskmanager
+    hostname: flink-taskmanager
+    command: taskmanager
+    depends_on:
+      flink-jobmanager:
+        condition: service_started
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
     restart: "no"
 
 volumes:
@@ -153,3 +228,5 @@ volumes:
   nifi_flowfile:
   nifi_content:
   nifi_provenance:
+  prometheus_data:
+  grafana_data:
