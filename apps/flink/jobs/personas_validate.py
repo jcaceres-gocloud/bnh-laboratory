@@ -8,7 +8,8 @@ from pyflink.datastream.connectors.kafka import (
     KafkaOffsetsInitializer,
     KafkaSource,
 )
-
+from pyflink.common.serialization import Encoder
+from pyflink.datastream.connectors.file_system import FileSink
 
 def normalizar_y_validar(raw: str) -> str:
     try:
@@ -69,6 +70,8 @@ def main():
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(1)
 
+    env.enable_checkpointing(5000)
+
     source = (
         KafkaSource.builder()
         .set_bootstrap_servers("kafka:19092")
@@ -90,9 +93,19 @@ def main():
         output_type=Types.STRING(),
     )
 
+    bronze_sink = (
+        FileSink
+        .for_row_format(
+            "s3://bnh-bronze/personas/",
+            Encoder.simple_string_encoder(),
+        )
+        .build()
+    )
+
+    validadas.sink_to(bronze_sink)
     validadas.print()
 
-    env.execute("BNH - Personas Normalize and Validate")
+    env.execute("BNH - Personas Normalize Validate and Bronze")
 
 
 if __name__ == "__main__":

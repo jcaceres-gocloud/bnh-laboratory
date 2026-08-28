@@ -18,3 +18,8 @@ RUN curl -fL \
 RUN curl -fL \
     https://repo.maven.apache.org/maven2/org/apache/kafka/kafka-clients/4.2.0/kafka-clients-4.2.0.jar \
     -o /opt/flink/lib/kafka-clients-4.2.0.jar
+
+
+RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop && \
+    cp /opt/flink/opt/flink-s3-fs-hadoop-2.1.1.jar \
+        /opt/flink/plugins/s3-fs-hadoop/

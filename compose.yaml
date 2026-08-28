@@ -201,6 +201,10 @@ services:
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
+        s3.endpoint: http://minio:9000
+        s3.access-key: bnhadmin
+        s3.secret-key: BnhMinioLaboratory1234
+        s3.path.style.access: true
     restart: "no"
 
   flink-taskmanager:
@@ -218,6 +222,40 @@ services:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 2
+        s3.endpoint: http://minio:9000
+        s3.access-key: bnhadmin
+        s3.secret-key: BnhMinioLaboratory1234
+        s3.path.style.access: true
+    restart: "no"
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: bnh-minio
+    hostname: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: bnhadmin
+      MINIO_ROOT_PASSWORD: BnhMinioLaboratory1234
+    volumes:
+      - minio_data:/data
+    restart: "no"
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    container_name: bnh-minio-init
+    depends_on:
+      - minio
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        until mc alias set bnh http://minio:9000 bnhadmin BnhMinioLaboratory1234; do
+          sleep 1
+        done
+        mc mb --ignore-existing bnh/bnh-bronze
     restart: "no"
 
 volumes:
@@ -230,3 +268,4 @@ volumes:
   nifi_provenance:
   prometheus_data:
   grafana_data:
+  minio_data:

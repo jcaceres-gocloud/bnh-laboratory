@@ -2785,29 +2785,385 @@ El contrato gRPC y el contrato REST coexistirán como interfaces públicas de BN
 
 ---
 
-### 5.14 Pendiente — pruebas de volumen
+### 5.14 Pruebas de volumen realizadas
 
-Antes de continuar con Flink se realizarán pruebas de carga gRPC con:
+Antes de incorporar Flink se ejecutaron pruebas de carga sobre el canal gRPC.
+
+Se probaron los siguientes volúmenes:
+
+- 10 registros.
+- 1.000 registros.
+- 10.000 registros.
+- 100.000 registros.
+- 1.000.000 de registros.
+
+Para evitar distorsiones se eliminaron los logs por registro del servidor.
+
+Resultados observados en el laboratorio:
 
 ```text
 10 registros
+duración: 0.019 s
+throughput aproximado: 513 registros/s
+
 1.000 registros
+duración: 0.043 s
+throughput aproximado: 23.300 registros/s
+
 10.000 registros
+duración: 0.341 s
+throughput aproximado: 29.360 registros/s
+
 100.000 registros
+duración: 3.164 s
+throughput aproximado: 31.600 registros/s
+
+1.000.000 registros
+duración: 33.504 s
+throughput aproximado: 29.850 registros/s
 ```
 
-Para evitar distorsionar las mediciones se eliminarán previamente los logs por registro.
+Estas mediciones corresponden exclusivamente al laboratorio local y no deben
+interpretarse como un benchmark productivo.
 
-Las pruebas deberán registrar al menos:
+El objetivo de estas pruebas fue verificar que el flujo gRPC → Kafka se mantuviera
+estable al aumentar el volumen antes de incorporar procesamiento con Flink.
+
+---
+
+## Etapa 6 — Capa Bronze con Apache Flink y MinIO
+
+El laboratorio incorpora una primera implementación de la capa Bronze utilizando
+Apache Flink para el procesamiento de eventos y MinIO como almacenamiento
+compatible con S3.
+
+El objetivo de esta etapa es validar el flujo técnico completo desde los canales
+de ingesta hasta la persistencia, sin implementar todavía lógica de negocio
+educativa compleja ni persistencia analítica en PostgreSQL.
+
+### Flujo de la etapa
+
+La arquitectura de esta etapa contempla el siguiente recorrido:
 
 ```text
-cantidad enviada
-cantidad recibida
-tiempo total
-registros por segundo
-errores
+gRPC / REST / NiFi
+        |
+        v
+      Kafka
+        |
+        v
+   Apache Flink
+        |
+        | normalización básica
+        | validaciones técnicas
+        v
+      MinIO
+        |
+        v
+  bucket bnh-bronze
 ```
 
-Luego se podrá repetir una prueba equivalente mediante REST para disponer de una comparación utilizando el mismo backend Kafka.
+El recorrido validado end-to-end hasta la capa Bronze corresponde actualmente a gRPC.
 
-Estas pruebas son de laboratorio y no constituyen todavía un benchmark productivo.
+REST y NiFi ya fueron validados como canales de ingesta hacia Kafka, pero todavía
+no se ejecutó la misma prueba completa hasta MinIO para ambos canales.
+
+La prueba end-to-end realizada para Personas fue:
+
+```text
+gRPC
+  -> Kafka
+  -> PyFlink
+  -> normalización y validación
+  -> FileSink S3
+  -> MinIO / bnh-bronze/personas/
+```
+
+### MinIO
+
+Para el laboratorio se utiliza:
+
+```text
+minio/minio:RELEASE.2025-09-07T16-13-09Z
+```
+
+MinIO expone:
+
+* API S3: [http://localhost:9000](http://localhost:9000)
+* Consola web: [http://localhost:9001](http://localhost:9001)
+
+El almacenamiento se persiste mediante el volumen Docker:
+
+```text
+minio_data
+```
+
+El bucket utilizado para la capa Bronze es:
+
+```text
+bnh-bronze
+```
+
+#### Inicialización automática del bucket
+
+El servicio `minio-init` utiliza el cliente oficial de MinIO (`mc`) para crear
+automáticamente el bucket necesario por la capa Bronze.
+
+El inicializador:
+
+1. espera hasta que MinIO acepte conexiones;
+2. configura el alias interno `bnh`;
+3. crea `bnh-bronze` si todavía no existe;
+4. termina con código `0`.
+
+La creación utiliza:
+
+```text
+mc mb --ignore-existing bnh/bnh-bronze
+```
+
+Por lo tanto, el proceso puede ejecutarse nuevamente sin eliminar ni recrear el
+bucket existente.
+
+Para ejecutar la inicialización manualmente:
+
+```bash
+docker compose up minio-init
+```
+
+Esto evita depender de la creación manual del bucket desde la consola web de
+MinIO y mejora la reproducibilidad del laboratorio.
+
+> La versión y las credenciales utilizadas son exclusivamente para el
+> laboratorio local y no constituyen una definición para ambientes productivos.
+
+### Integración Flink con S3
+
+Flink utiliza el plugin oficial:
+
+```text
+flink-s3-fs-hadoop-2.1.1.jar
+```
+
+El plugin se habilita dentro de:
+
+```text
+/opt/flink/plugins/s3-fs-hadoop/
+```
+
+La configuración del JobManager y TaskManager apunta al endpoint S3-compatible
+de MinIO:
+
+```text
+s3.endpoint: http://minio:9000
+s3.path.style.access: true
+```
+
+Esto permite que PyFlink utilice rutas del tipo:
+
+```text
+s3://bnh-bronze/...
+```
+
+mediante `FileSink`.
+
+### Smoke test Flink -> MinIO
+
+Se incorporó el job:
+
+```text
+apps/flink/jobs/s3_smoke.py
+```
+
+Este job genera un registro de prueba mediante PyFlink y lo persiste
+directamente en:
+
+```text
+s3://bnh-bronze/flink-smoke/
+```
+
+La prueba fue ejecutada correctamente y el objeto resultante pudo ser listado y
+leído posteriormente desde MinIO.
+
+Con esto se validó técnicamente:
+
+```text
+PyFlink
+  -> FileSink
+  -> plugin S3
+  -> MinIO
+  -> bucket Bronze
+```
+
+### Procesamiento de Personas
+
+El job:
+
+```text
+apps/flink/jobs/personas_validate.py
+```
+
+consume eventos desde:
+
+```text
+topic: bnh.personas
+bootstrap server: kafka:19092
+```
+
+Actualmente realiza una normalización técnica mínima para soportar distintos
+formatos de entrada del laboratorio.
+
+Un evento con envelope:
+
+```json
+{
+  "metadata": {
+    "jurisdiccion": "ARG-B",
+    "dominio": "persona",
+    "lote_id": "L-GRPC-3"
+  },
+  "registro": {
+    "id": "P000001",
+    "nombre": "Persona 1"
+  }
+}
+```
+
+se conserva bajo la estructura común utilizada por el laboratorio.
+
+También se soportan registros planos provenientes de pruebas de ingesta mediante
+NiFi, agregando la metadata mínima necesaria.
+
+El resultado actual posee la forma:
+
+```json
+{
+  "estado_validacion": "VALIDO",
+  "errores": [],
+  "metadata": {
+    "jurisdiccion": "ARG-B",
+    "dominio": "persona",
+    "lote_id": "L-GRPC-3"
+  },
+  "registro": {
+    "id": "P000001",
+    "nombre": "Persona 1"
+  }
+}
+```
+
+Las validaciones existentes son deliberadamente simples y corresponden al
+laboratorio. Actualmente permiten verificar, entre otras cosas:
+
+* JSON válido.
+* presencia de jurisdicción.
+* presencia del identificador del registro.
+* adaptación de distintos formatos de entrada a una estructura común.
+
+Estas reglas no constituyen todavía el contrato definitivo de Persona ni las
+reglas de negocio de BNH.
+
+### Checkpointing
+
+El job de streaming habilita checkpointing cada 5 segundos:
+
+```python
+env.enable_checkpointing(5000)
+```
+
+Esto es necesario para que `FileSink` pueda completar y publicar los archivos
+generados durante un flujo continuo.
+
+Además de permitir la persistencia en Bronze, el checkpointing será parte de las
+próximas pruebas relacionadas con recuperación ante fallos y garantías de
+procesamiento.
+
+### Prueba end-to-end
+
+Con el job de Flink en ejecución se enviaron tres registros mediante el cliente
+gRPC:
+
+```bash
+TOTAL_PERSONAS=3 docker compose run --rm grpc-client
+```
+
+Resultado:
+
+```text
+cantidad_enviada=3
+cantidad_recibida=3
+lote_id=L-GRPC-3
+estado=RECIBIDO
+```
+
+Luego del checkpoint de Flink se generó un objeto en:
+
+```text
+bnh-bronze/personas/
+```
+
+El contenido persistido fue:
+
+```json
+{"estado_validacion":"VALIDO","errores":[],"metadata":{"jurisdiccion":"ARG-B","dominio":"persona","lote_id":"L-GRPC-3"},"registro":{"id":"P000001","nombre":"Persona 1"}}
+{"estado_validacion":"VALIDO","errores":[],"metadata":{"jurisdiccion":"ARG-B","dominio":"persona","lote_id":"L-GRPC-3"},"registro":{"id":"P000002","nombre":"Persona 2"}}
+{"estado_validacion":"VALIDO","errores":[],"metadata":{"jurisdiccion":"ARG-B","dominio":"persona","lote_id":"L-GRPC-3"},"registro":{"id":"P000003","nombre":"Persona 3"}}
+```
+
+De esta forma quedó validado el recorrido:
+
+```text
+gRPC -> Kafka -> Flink -> Bronze
+```
+
+### Estado actual
+
+Validado en el laboratorio:
+
+* Kafka como bus de eventos.
+* gRPC como canal de ingesta.
+* NiFi como canal de ingesta desde archivos.
+* PyFlink consumiendo Kafka.
+* normalización y validación técnica básica.
+* checkpointing de Flink.
+* MinIO como almacenamiento S3-compatible.
+* escritura desde Flink hacia Bronze.
+* lectura posterior de los objetos persistidos.
+
+### Alcance actual
+
+El trabajo se encuentra limitado a la capa Bronze.
+
+Por el momento quedan fuera de esta etapa:
+
+* persistencia en PostgreSQL.
+* procesamiento analítico con Spark.
+* orquestación con Airflow.
+* reglas educativas complejas.
+* calificaciones.
+* modelo definitivo de datos.
+
+Estas etapas se retomarán cuando exista mayor definición de los contratos y de
+los datos reales proporcionados por las jurisdicciones.
+
+### Próximas investigaciones
+
+La siguiente etapa del laboratorio estará orientada a estudiar qué capacidades
+de Flink resultan útiles dentro de la capa Bronze, priorizando controles
+técnicos sobre reglas educativas todavía no definidas.
+
+Entre los casos a evaluar se encuentran:
+
+* cálculo de checksum.
+* validaciones por campo.
+* validaciones por lote.
+* detección de duplicados.
+* separación de registros válidos e inválidos.
+* preservación del evento original.
+* state y ventanas.
+* comportamiento ante fallos.
+* recuperación mediante checkpoints.
+* garantías de entrega y procesamiento.
+
+La definición final de estas reglas dependerá de los contratos y ejemplos de
+datos que proporcione el cliente.
