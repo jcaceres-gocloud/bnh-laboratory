@@ -51,11 +51,21 @@ def normalizar_y_validar(raw: str) -> str:
             "registro": data,
         }
 
+    id_persona = normalizado["registro"].get("id_persona")
+
+    if isinstance(id_persona, int) and not isinstance(id_persona, bool):
+        normalizado["registro"]["id_persona"] = str(id_persona)
+
+    nro_documento = normalizado["registro"].get("nro_documento")
+
+    if isinstance(nro_documento, int) and not isinstance(nro_documento, bool):
+        normalizado["registro"]["nro_documento"] = str(nro_documento)
+
     if not normalizado["metadata"]["jurisdiccion"]:
         errores.append("metadata.jurisdiccion requerida")
 
-    if not normalizado["registro"].get("id"):
-        errores.append("registro.id requerido")
+    if not normalizado["registro"].get("id_persona"):
+        errores.append("registro.id_persona requerido")
 
     resultado = {
         "estado_validacion": "INVALIDO" if errores else "VALIDO",
