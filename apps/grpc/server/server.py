@@ -65,27 +65,26 @@ class PersonasService(personas_pb2_grpc.PersonasServiceServicer):
 
             PERSONAS_RECEIVED.inc()
 
+            registro = {
+                campo.name: valor
+                for campo, valor in request.registro.ListFields()
+            }
+
             evento = {
                 "metadata": {
                     "jurisdiccion": request.metadata.jurisdiccion,
                     "dominio": request.metadata.dominio,
                     "lote_id": request.metadata.lote_id,
                 },
-                "registro": {
-                    "id": request.registro.id,
-                    "nombre": request.registro.nombre,
-                },
+                "registro": registro,
             }
 
-            key = (
-                f"{request.metadata.jurisdiccion}:"
-                f"{request.registro.id}"
-            )
+            id_persona = registro.get("id_persona", "")
 
             producer.produce(
                 topic="bnh.personas",
-                key=key,
-                value=json.dumps(evento),
+                key=f"{request.metadata.jurisdiccion}:{id_persona}",
+                value=json.dumps(evento, ensure_ascii=False),
             )
 
             KAFKA_ENQUEUED.inc()

@@ -150,6 +150,8 @@ services:
 
     environment:
       TOTAL_PERSONAS: ${TOTAL_PERSONAS:-10}
+      GRPC_CASE: ${GRPC_CASE:-valid}
+      LOTE_ID: ${LOTE_ID:-}
 
     restart: "no"
 

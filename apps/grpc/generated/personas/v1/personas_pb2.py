@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1apersonas/v1/personas.proto\x12\x0f\x62nh.personas.v1\"B\n\x08Metadata\x12\x14\n\x0cjurisdiccion\x18\x01 \x01(\t\x12\x0f\n\x07\x64ominio\x18\x02 \x01(\t\x12\x0f\n\x07lote_id\x18\x03 \x01(\t\"%\n\x07Persona\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0e\n\x06nombre\x18\x02 \x01(\t\"n\n\x13\x43\x61rgaPersonaRequest\x12+\n\x08metadata\x18\x01 \x01(\x0b\x32\x19.bnh.personas.v1.Metadata\x12*\n\x08registro\x18\x02 \x01(\x0b\x32\x18.bnh.personas.v1.Persona\"L\n\x0eResultadoCarga\x12\x0f\n\x07lote_id\x18\x01 \x01(\t\x12\x19\n\x11\x63\x61ntidad_recibida\x18\x02 \x01(\x05\x12\x0e\n\x06\x65stado\x18\x03 \x01(\t2l\n\x0fPersonasService\x12Y\n\x0e\x45nviarPersonas\x12$.bnh.personas.v1.CargaPersonaRequest\x1a\x1f.bnh.personas.v1.ResultadoCarga(\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1apersonas/v1/personas.proto\x12\x0f\x62nh.personas.v1\"B\n\x08Metadata\x12\x14\n\x0cjurisdiccion\x18\x01 \x01(\t\x12\x0f\n\x07\x64ominio\x18\x02 \x01(\t\x12\x0f\n\x07lote_id\x18\x03 \x01(\t\"\xd3\x05\n\x07Persona\x12\x17\n\nid_persona\x18\x01 \x01(\tH\x00\x88\x01\x01\x12\x1d\n\x10\x66\x65\x63ha_nacimiento\x18\x02 \x01(\tH\x01\x88\x01\x01\x12\x11\n\x04\x63uit\x18\x03 \x01(\tH\x02\x88\x01\x01\x12\x18\n\x0b\x63_documento\x18\x04 \x01(\tH\x03\x88\x01\x01\x12\x1a\n\rnro_documento\x18\x05 \x01(\tH\x04\x88\x01\x01\x12\x1e\n\x11\x63_pais_nacimiento\x18\x06 \x01(\tH\x05\x88\x01\x01\x12#\n\x16\x63_provincia_nacimiento\x18\x07 \x01(\tH\x06\x88\x01\x01\x12&\n\x19\x63_departamento_nacimiento\x18\x08 \x01(\tH\x07\x88\x01\x01\x12#\n\x16\x63_localidad_nacimiento\x18\t \x01(\tH\x08\x88\x01\x01\x12#\n\x16\x63_municipio_nacimiento\x18\n \x01(\tH\t\x88\x01\x01\x12\x1d\n\x10lugar_nacimiento\x18\x0b \x01(\tH\n\x88\x01\x01\x12\x18\n\x0b\x63_fallecido\x18\x0c \x01(\tH\x0b\x88\x01\x01\x12\x1c\n\x0f\x66\x65\x63ha_fallecido\x18\r \x01(\tH\x0c\x88\x01\x01\x12\x1a\n\rc_es_indigena\x18\x0e \x01(\tH\r\x88\x01\x01\x42\r\n\x0b_id_personaB\x13\n\x11_fecha_nacimientoB\x07\n\x05_cuitB\x0e\n\x0c_c_documentoB\x10\n\x0e_nro_documentoB\x14\n\x12_c_pais_nacimientoB\x19\n\x17_c_provincia_nacimientoB\x1c\n\x1a_c_departamento_nacimientoB\x19\n\x17_c_localidad_nacimientoB\x19\n\x17_c_municipio_nacimientoB\x13\n\x11_lugar_nacimientoB\x0e\n\x0c_c_fallecidoB\x12\n\x10_fecha_fallecidoB\x10\n\x0e_c_es_indigena\"n\n\x13\x43\x61rgaPersonaRequest\x12+\n\x08metadata\x18\x01 \x01(\x0b\x32\x19.bnh.personas.v1.Metadata\x12*\n\x08registro\x18\x02 \x01(\x0b\x32\x18.bnh.personas.v1.Persona\"L\n\x0eResultadoCarga\x12\x0f\n\x07lote_id\x18\x01 \x01(\t\x12\x19\n\x11\x63\x61ntidad_recibida\x18\x02 \x01(\x05\x12\x0e\n\x06\x65stado\x18\x03 \x01(\t2l\n\x0fPersonasService\x12Y\n\x0e\x45nviarPersonas\x12$.bnh.personas.v1.CargaPersonaRequest\x1a\x1f.bnh.personas.v1.ResultadoCarga(\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -33,12 +33,12 @@ if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_METADATA']._serialized_start=47
   _globals['_METADATA']._serialized_end=113
-  _globals['_PERSONA']._serialized_start=115
-  _globals['_PERSONA']._serialized_end=152
-  _globals['_CARGAPERSONAREQUEST']._serialized_start=154
-  _globals['_CARGAPERSONAREQUEST']._serialized_end=264
-  _globals['_RESULTADOCARGA']._serialized_start=266
-  _globals['_RESULTADOCARGA']._serialized_end=342
-  _globals['_PERSONASSERVICE']._serialized_start=344
-  _globals['_PERSONASSERVICE']._serialized_end=452
+  _globals['_PERSONA']._serialized_start=116
+  _globals['_PERSONA']._serialized_end=839
+  _globals['_CARGAPERSONAREQUEST']._serialized_start=841
+  _globals['_CARGAPERSONAREQUEST']._serialized_end=951
+  _globals['_RESULTADOCARGA']._serialized_start=953
+  _globals['_RESULTADOCARGA']._serialized_end=1029
+  _globals['_PERSONASSERVICE']._serialized_start=1031
+  _globals['_PERSONASSERVICE']._serialized_end=1139
 # @@protoc_insertion_point(module_scope)

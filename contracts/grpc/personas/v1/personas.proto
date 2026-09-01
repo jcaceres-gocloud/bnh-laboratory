@@ -10,9 +10,24 @@ message Metadata {
 }
 
 
+// Transporte del registro. La validación de Persona la hace Flink.
+// optional permite omitir campos; proto3 no puede representar ints/bools
+// ni JSON null, a diferencia de REST/Kafka.
 message Persona {
-  string id = 1;
-  string nombre = 2;
+  optional string id_persona = 1;
+  optional string fecha_nacimiento = 2;
+  optional string cuit = 3;
+  optional string c_documento = 4;
+  optional string nro_documento = 5;
+  optional string c_pais_nacimiento = 6;
+  optional string c_provincia_nacimiento = 7;
+  optional string c_departamento_nacimiento = 8;
+  optional string c_localidad_nacimiento = 9;
+  optional string c_municipio_nacimiento = 10;
+  optional string lugar_nacimiento = 11;
+  optional string c_fallecido = 12;
+  optional string fecha_fallecido = 13;
+  optional string c_es_indigena = 14;
 }
 
 

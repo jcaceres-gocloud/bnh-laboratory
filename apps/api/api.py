@@ -1,8 +1,9 @@
 import json
+from typing import Any
 
 from confluent_kafka import Producer
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 app = FastAPI(title="BNH Laboratory API")
@@ -22,13 +23,41 @@ class Metadata(BaseModel):
 
 
 class Persona(BaseModel):
-    id: str
-    nombre: str
+    model_config = ConfigDict(extra="allow")
+
+    id_persona: Any = None
+    fecha_nacimiento: Any = None
+    cuit: Any = None
+    c_documento: Any = None
+    nro_documento: Any = None
+    c_pais_nacimiento: Any = None
+    c_provincia_nacimiento: Any = None
+    c_departamento_nacimiento: Any = None
+    c_localidad_nacimiento: Any = None
+    c_municipio_nacimiento: Any = None
+    lugar_nacimiento: Any = None
+    c_fallecido: Any = None
+    fecha_fallecido: Any = None
+    c_es_indigena: Any = None
 
 
 class PersonasPayload(BaseModel):
     metadata: Metadata
-    registros: list[Persona]
+    registro: Persona | None = None
+    registros: list[Persona] | None = None
+
+    @model_validator(mode="after")
+    def exigir_registro(self):
+        if self.registro is None and self.registros is None:
+            raise ValueError("se requiere registro o registros")
+        return self
+
+
+def personas_del_payload(payload: PersonasPayload) -> list[Persona]:
+    if payload.registros is not None:
+        return payload.registros
+
+    return [payload.registro]
 
 
 @app.get("/health")
@@ -38,18 +67,24 @@ def health():
 
 @app.post("/personas", status_code=202)
 def crear_personas(payload: PersonasPayload):
-    for persona in payload.registros:
+    personas = personas_del_payload(payload)
+    metadata = payload.metadata.model_dump()
+
+    for persona in personas:
+        registro = persona.model_dump(exclude_unset=True)
         evento = {
-            "metadata": payload.metadata.model_dump(),
-            "registro": persona.model_dump(),
+            "metadata": metadata,
+            "registro": registro,
         }
 
-        key = f"{payload.metadata.jurisdiccion}:{persona.id}"
+        id_persona = registro.get("id_persona")
+        if id_persona is None:
+            id_persona = ""
 
         producer.produce(
             topic="bnh.personas",
-            key=key,
-            value=json.dumps(evento),
+            key=f"{payload.metadata.jurisdiccion}:{id_persona}",
+            value=json.dumps(evento, ensure_ascii=False),
         )
 
     producer.flush()
@@ -57,5 +92,5 @@ def crear_personas(payload: PersonasPayload):
     return {
         "status": "accepted",
         "lote_id": payload.metadata.lote_id,
-        "cantidad_registros": len(payload.registros),
+        "cantidad_registros": len(personas),
     }
