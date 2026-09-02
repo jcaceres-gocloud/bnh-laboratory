@@ -3167,3 +3167,512 @@ Entre los casos a evaluar se encuentran:
 
 La definición final de estas reglas dependerá de los contratos y ejemplos de
 datos que proporcione el cliente.
+
+
+## Validación e integración de Persona hasta Bronze
+
+### Objetivo
+
+El laboratorio implementa y valida el flujo de ingestión de la entidad
+`Persona` hasta la capa Bronze.
+
+La arquitectura probada actualmente es:
+
+```text
+REST ──┐
+       │
+gRPC ──┼──> Kafka (`bnh.personas`) ──> PyFlink ──> Bronze (S3 compatible)
+       │
+NiFi ──┘
+````
+
+Estado actual:
+
+* REST → Kafka → Flink → Bronze: validado.
+* gRPC → Kafka → Flink → Bronze: validado.
+* REST y gRPC producen el mismo registro canónico en Bronze.
+* NiFi todavía debe alinearse al contrato actual de Persona.
+
+La validación funcional/técnica común de Persona se centraliza en Flink.
+Los canales de ingreso se encargan principalmente del transporte y de
+construir el envelope necesario.
+
+---
+
+### Modelo actual de Persona
+
+El registro normalizado contiene siempre los siguientes campos:
+
+```text
+id_persona
+fecha_nacimiento
+cuit
+c_documento
+nro_documento
+c_pais_nacimiento
+c_provincia_nacimiento
+c_departamento_nacimiento
+c_localidad_nacimiento
+c_municipio_nacimiento
+lugar_nacimiento
+c_fallecido
+fecha_fallecido
+c_es_indigena
+```
+
+Flink genera una representación canónica del registro:
+
+* todos los campos conocidos están siempre presentes;
+* los campos ausentes quedan como `null`;
+* los campos adicionales recibidos se conservan;
+* determinados identificadores/códigos numéricos se normalizan a `string`.
+
+Ejemplo:
+
+```json
+{
+  "estado_validacion": "VALIDO",
+  "errores": [],
+  "metadata": {
+    "jurisdiccion": "ARG-B",
+    "dominio": "persona",
+    "lote_id": "REST-CANON-001"
+  },
+  "registro": {
+    "id_persona": "P000001",
+    "fecha_nacimiento": "1990-05-10",
+    "cuit": "20123456789",
+    "c_documento": "DNI",
+    "nro_documento": "12345678",
+    "c_pais_nacimiento": "ARG",
+    "c_provincia_nacimiento": "B",
+    "c_departamento_nacimiento": "001",
+    "c_localidad_nacimiento": "001",
+    "c_municipio_nacimiento": "001",
+    "lugar_nacimiento": "Buenos Aires",
+    "c_fallecido": "N",
+    "fecha_fallecido": null,
+    "c_es_indigena": "N"
+  }
+}
+```
+
+---
+
+### Responsabilidades por componente
+
+#### REST / gRPC
+
+Los canales de entrada:
+
+* reciben el registro;
+* conservan metadata;
+* construyen el envelope;
+* publican en Kafka;
+* generan la key Kafka a partir de `jurisdiccion:id_persona`.
+
+No duplican las reglas de validación implementadas en Flink.
+
+Por ejemplo, un CUIT inválido como:
+
+```text
+2012345678A
+```
+
+puede ser aceptado por REST/gRPC y transportado a Kafka.
+
+Flink es quien posteriormente lo clasifica como `INVALIDO`.
+
+#### Kafka
+
+Kafka funciona como capa de transporte y desacoplamiento.
+
+Topic actual:
+
+```text
+bnh.personas
+```
+
+El laboratorio utiliza 3 particiones y replication factor 1.
+
+Kafka no aplica reglas de validación de Persona.
+
+#### Flink
+
+Flink centraliza:
+
+* parsing;
+* validación estructural;
+* normalización;
+* canonicalización;
+* validaciones técnicas de Persona;
+* generación de `estado_validacion`;
+* generación de errores;
+* persistencia hacia Bronze.
+
+Job:
+
+```text
+BNH - Personas Normalize Validate and Bronze
+```
+
+Archivo:
+
+```text
+apps/flink/jobs/personas_validate.py
+```
+
+#### Bronze
+
+Los resultados procesados por Flink se persisten actualmente en:
+
+```text
+s3://bnh-bronze/personas/
+```
+
+La implementación utiliza `FileSink`.
+
+Durante una escritura pueden aparecer archivos temporales:
+
+```text
+_part-..._tmp_...
+```
+
+Cuando ocurre el rolling del archivo y el checkpoint correspondiente,
+el objeto pasa a un archivo final:
+
+```text
+part-...
+```
+
+Esto es comportamiento normal del FileSink.
+
+---
+
+## Casos sintéticos de Persona
+
+Los datos reutilizables están en:
+
+```text
+scripts/testdata/personas.py
+```
+
+Casos disponibles:
+
+```text
+valid
+missing-id
+missing-birth-date
+missing-document-type
+missing-country
+missing-indigenous
+numeric-identifiers
+numeric-country-code
+numeric-codes
+invalid-birth-date
+invalid-death-date
+invalid-cuit-length
+invalid-cuit-nondigit
+invalid-root
+invalid-envelope
+invalid-place-type
+```
+
+También existe un smoke check rápido:
+
+```text
+scripts/testdata/check_personas.py
+```
+
+Ejecutar:
+
+```bash
+python3 scripts/testdata/check_personas.py
+```
+
+Actualmente cubre 16 casos.
+
+Este script permite revisar rápidamente la lógica Python, pero la evidencia
+principal del laboratorio continúa siendo el flujo real:
+
+```text
+canal → Kafka → Flink → Bronze
+```
+
+---
+
+## Levantar el flujo Persona
+
+Ejecutar desde la raíz del repositorio.
+
+### Infraestructura mínima
+
+```bash
+docker compose up -d \
+  kafka \
+  minio \
+  minio-init \
+  flink-jobmanager \
+  flink-taskmanager
+```
+
+### Crear el topic Kafka
+
+En un entorno nuevo:
+
+```bash
+docker exec bnh-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --create \
+  --if-not-exists \
+  --topic bnh.personas \
+  --partitions 3 \
+  --replication-factor 1
+```
+
+> La creación automática del topic todavía no está implementada.
+
+### Ejecutar el job de Flink
+
+```bash
+docker exec bnh-flink-jobmanager \
+  flink run -d \
+  -py /opt/flink/jobs/personas_validate.py
+```
+
+Verificar:
+
+```bash
+curl -s http://localhost:8081/jobs/overview
+```
+
+Debe existir un job:
+
+```text
+BNH - Personas Normalize Validate and Bronze
+```
+
+en estado:
+
+```text
+RUNNING
+```
+
+---
+
+## Validar REST
+
+Construir y levantar:
+
+```bash
+docker compose build api
+docker compose up -d api
+```
+
+Health check:
+
+```bash
+curl -s http://localhost:8000/health
+```
+
+### Persona válida
+
+```bash
+python3 scripts/testdata/personas.py --case valid \
+  | python3 -c '
+import sys,json
+data=json.load(sys.stdin)
+data["metadata"]["lote_id"]="REST-VALID-001"
+print(json.dumps(data, ensure_ascii=False))
+' \
+  | curl -s -w '\nHTTP %{http_code}\n' \
+      -X POST http://localhost:8000/personas \
+      -H "Content-Type: application/json" \
+      -d @-
+```
+
+Esperado:
+
+```text
+HTTP 202
+```
+
+y posteriormente Flink:
+
+```text
+estado_validacion = VALIDO
+```
+
+### Persona con CUIT inválido
+
+```bash
+python3 scripts/testdata/personas.py --case invalid-cuit-nondigit \
+  | python3 -c '
+import sys,json
+data=json.load(sys.stdin)
+data["metadata"]["lote_id"]="REST-INVALID-CUIT-001"
+print(json.dumps(data, ensure_ascii=False))
+' \
+  | curl -s -w '\nHTTP %{http_code}\n' \
+      -X POST http://localhost:8000/personas \
+      -H "Content-Type: application/json" \
+      -d @-
+```
+
+REST debe aceptar el registro (`HTTP 202`).
+
+Flink debe generar:
+
+```text
+estado_validacion = INVALIDO
+registro.cuit debe contener solo digitos
+```
+
+---
+
+## Validar gRPC
+
+Construir:
+
+```bash
+docker compose build grpc-server grpc-client
+docker compose up -d grpc-server
+```
+
+### Persona válida
+
+```bash
+TOTAL_PERSONAS=1 \
+GRPC_CASE=valid \
+LOTE_ID=GRPC-VALID-001 \
+docker compose run --rm grpc-client
+```
+
+### CUIT inválido
+
+```bash
+TOTAL_PERSONAS=1 \
+GRPC_CASE=invalid-cuit \
+LOTE_ID=GRPC-INVALID-CUIT-001 \
+docker compose run --rm grpc-client
+```
+
+gRPC debe aceptar ambos registros.
+
+Flink debe producir respectivamente:
+
+```text
+GRPC-VALID-001
+→ VALIDO
+```
+
+y:
+
+```text
+GRPC-INVALID-CUIT-001
+→ INVALIDO
+→ registro.cuit debe contener solo digitos
+```
+
+---
+
+## Verificar Flink
+
+Buscar ejecuciones por lote:
+
+```bash
+docker logs --tail 1000 bnh-flink-taskmanager 2>&1 \
+  | grep -E 'REST-VALID-001|REST-INVALID-CUIT-001|GRPC-VALID-001|GRPC-INVALID-CUIT-001'
+```
+
+---
+
+## Verificar Bronze
+
+Listar objetos:
+
+```bash
+docker compose run --rm \
+  --entrypoint /bin/sh \
+  minio-init \
+  -c '
+    mc alias set bnh http://minio:9000 bnhadmin BnhMinioLaboratory1234 >/dev/null &&
+    mc ls --recursive bnh/bnh-bronze/personas
+  '
+```
+
+Para inspeccionar un objeto:
+
+```bash
+docker compose run --rm \
+  --entrypoint /bin/sh \
+  minio-init \
+  -c '
+    mc alias set bnh http://minio:9000 bnhadmin BnhMinioLaboratory1234 >/dev/null &&
+    mc cat bnh/bnh-bronze/personas/<RUTA_DEL_ARCHIVO>
+  '
+```
+
+Se comprobó que REST y gRPC, enviando la misma Persona, generan en Bronze:
+
+* el mismo `registro`;
+* el mismo `estado_validacion`;
+* los mismos `errores`.
+
+La única diferencia esperada entre ambos mensajes es metadata de trazabilidad,
+por ejemplo `lote_id`.
+
+---
+
+## Estado de NiFi
+
+NiFi todavía utiliza el flujo inicial del laboratorio y debe alinearse al
+modelo actual.
+
+El objetivo pendiente es:
+
+```text
+archivo
+  ↓
+NiFi
+  ↓
+{metadata, registro}
+  ↓
+Kafka
+  ↓
+Flink
+  ↓
+Bronze
+```
+
+NiFi debe publicar el mismo envelope que REST y gRPC y preservar
+identificadores/códigos como strings, evitando pérdida de información por
+inferencia automática de tipos CSV.
+
+La compatibilidad de Flink con mensajes planos se mantiene temporalmente
+hasta completar esta migración.
+
+---
+
+## Reglas deliberadamente fuera de alcance actual
+
+Todavía no se implementan como validaciones duras:
+
+* dígito verificador de CUIT;
+* DNI → CUIT obligatorio;
+* DNI → número de documento únicamente numérico;
+* estados "En trámite" / "No Posee";
+* validación contra catálogos oficiales;
+* país/provincia/departamento/localidad/municipio;
+* dependencia geográfica entre códigos;
+* provincia obligatoria para Argentina;
+* lugar de nacimiento obligatorio para extranjeros;
+* relación `c_fallecido` / `fecha_fallecido`;
+* edad mínima/máxima;
+* fechas futuras;
+* relación nacimiento/fallecimiento;
+* movimientos posteriores al fallecimiento;
+* integración RENAPER / SINTyS / ANSES.
+
+Estas reglas requieren definiciones funcionales o catálogos oficiales y no se
+consideran confirmadas únicamente por aparecer en relevamientos/documentación.
