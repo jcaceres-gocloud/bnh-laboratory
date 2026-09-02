@@ -1,4 +1,6 @@
 import argparse
+import csv
+import io
 import json
 
 
@@ -18,6 +20,7 @@ CASE_NAMES = (
     "invalid-cuit-nondigit",
     "invalid-root",
     "invalid-envelope",
+    "invalid-flat",
     "invalid-place-type",
 )
 
@@ -27,6 +30,11 @@ CASOS_ESTRUCTURA = {
     "invalid-envelope": {
         "metadata": "metadata-invalida",
         "registro": "registro-invalido",
+    },
+    "invalid-flat": {
+        "id": "P101",
+        "nombre": "Carlos",
+        "jurisdiccion": "ARG-B",
     },
 }
 
@@ -106,6 +114,30 @@ def persona_base():
     }
 
 
+CAMPOS_METADATA_CSV = (
+    "jurisdiccion",
+    "dominio",
+    "lote_id",
+)
+
+CAMPOS_REGISTRO_CSV = (
+    "id_persona",
+    "fecha_nacimiento",
+    "cuit",
+    "c_documento",
+    "nro_documento",
+    "c_pais_nacimiento",
+    "c_provincia_nacimiento",
+    "c_departamento_nacimiento",
+    "c_localidad_nacimiento",
+    "c_municipio_nacimiento",
+    "lugar_nacimiento",
+    "c_fallecido",
+    "fecha_fallecido",
+    "c_es_indigena",
+)
+
+
 def generar_caso(nombre):
     if nombre in CASOS_ESTRUCTURA:
         return CASOS_ESTRUCTURA[nombre]
@@ -128,6 +160,67 @@ def generar_caso(nombre):
     raise ValueError(f"Caso desconocido: {nombre}")
 
 
+def _valor_csv(valor):
+    if valor is None:
+        return ""
+    return valor
+
+
+def payload_a_fila_csv(payload):
+    metadata = payload["metadata"]
+    registro = payload["registro"]
+
+    fila = {
+        campo: _valor_csv(metadata.get(campo))
+        for campo in CAMPOS_METADATA_CSV
+    }
+    fila.update(
+        {
+            campo: _valor_csv(registro.get(campo))
+            for campo in CAMPOS_REGISTRO_CSV
+        }
+    )
+    return fila
+
+
+def payload_a_csv(payload):
+    return payloads_a_csv([payload])
+
+
+def payloads_a_csv(payloads):
+    filas = [payload_a_fila_csv(payload) for payload in payloads]
+    columnas = [
+        campo
+        for campo in CAMPOS_METADATA_CSV + CAMPOS_REGISTRO_CSV
+        if any(fila.get(campo) != "" for fila in filas)
+    ]
+    buffer = io.StringIO()
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=columnas,
+        lineterminator="\n",
+        extrasaction="ignore",
+    )
+    writer.writeheader()
+    for fila in filas:
+        writer.writerow(fila)
+    return buffer.getvalue()
+
+
+def personas_del_lote(payload, cantidad):
+    personas = []
+
+    for indice in range(1, cantidad + 1):
+        persona = {
+            "metadata": dict(payload["metadata"]),
+            "registro": dict(payload["registro"]),
+        }
+        persona["registro"]["id_persona"] = f"P{indice:06d}"
+        personas.append(persona)
+
+    return personas
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -135,11 +228,62 @@ def main():
         choices=CASE_NAMES,
         default="valid",
     )
+    parser.add_argument(
+        "--format",
+        choices=("json", "csv"),
+        default="json",
+    )
+    parser.add_argument(
+        "--lote-id",
+        dest="lote_id",
+        default=None,
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=1,
+        help="Cantidad de Personas del lote (P000001, P000002, ...)",
+    )
     args = parser.parse_args()
+
+    if args.count < 1:
+        raise SystemExit("--count debe ser >= 1")
+
+    payload = generar_caso(args.case)
+
+    if args.lote_id:
+        if not isinstance(payload, dict) or "metadata" not in payload:
+            raise SystemExit(
+                "El caso seleccionado no admite override de lote_id"
+            )
+        payload["metadata"]["lote_id"] = args.lote_id
+
+    if args.count > 1:
+        if not isinstance(payload, dict) or "registro" not in payload:
+            raise SystemExit(
+                "El caso seleccionado no admite múltiples Personas"
+            )
+        personas = personas_del_lote(payload, args.count)
+    else:
+        personas = [payload] if isinstance(payload, dict) and "registro" in payload else None
+
+    if args.format == "csv":
+        if not personas:
+            raise SystemExit("El caso seleccionado no se puede emitir como CSV")
+        print(payloads_a_csv(personas), end="")
+        return
+
+    if args.count == 1:
+        salida = payload
+    else:
+        salida = {
+            "metadata": payload["metadata"],
+            "registros": [persona["registro"] for persona in personas],
+        }
 
     print(
         json.dumps(
-            generar_caso(args.case),
+            salida,
             ensure_ascii=False,
             indent=2,
         )

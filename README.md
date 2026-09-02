@@ -1798,6 +1798,10 @@ Kafka: bnh.personas
 
 Las relaciones `failure` de los processors principales se envían a `LogErrors`.
 
+> El flujo vigente, alineado al contrato Persona, inserta `JoltTransformJSON`
+> entre `SplitRecord` y `EvaluateJsonPath` para emitir `{metadata, registro}`.
+> Ver la sección de validación de Persona.
+
 ---
 
 ### 4.5 GetFile
@@ -2191,31 +2195,18 @@ También se comprobó:
 
 ### Pendiente
 
-El flujo NiFi fue creado actualmente desde la interfaz web y está persistido en los volúmenes Docker locales.
-
-Esto significa que todavía **no es reproducible solamente clonando el repositorio**.
-
-Próximo paso:
+El flujo inicial se creó desde la interfaz web. La definición vigente quedó
+versionada en:
 
 ```text
-Agrupar flujo NiFi
-        ↓
-Exportar definición
-        ↓
-Versionar en Git
-        ↓
-Importar desde otro entorno
+nifi/flows/BNH_-_Personas_File_Ingestion.json
 ```
 
-Estructura prevista:
+Para reconstruirla en otro entorno, importar el JSON (UI o
+`scripts/nifi/import_personas_flow.py`) y habilitar los Controller Services.
 
-```text
-nifi/
-└── flows/
-    └── personas-file-ingestion.json
-```
-
-Esto permitirá que otro integrante del equipo pueda clonar el laboratorio y reconstruir el flujo sin configurarlo manualmente desde cero.
+La alineación posterior al contrato `{metadata, registro}` está documentada
+en la sección de validación de Persona.
 
 ---
 ---
@@ -3190,8 +3181,10 @@ Estado actual:
 
 * REST → Kafka → Flink → Bronze: validado.
 * gRPC → Kafka → Flink → Bronze: validado.
-* REST y gRPC producen el mismo registro canónico en Bronze.
-* NiFi todavía debe alinearse al contrato actual de Persona.
+* NiFi → Kafka → Flink → Bronze: validado.
+* REST, gRPC y NiFi publican el envelope `{metadata, registro}` en `bnh.personas`.
+* Los tres canales producen el mismo registro canónico en Bronze.
+* `lote_id` es la única diferencia esperada.
 
 La validación funcional/técnica común de Persona se centraliza en Flink.
 Los canales de ingreso se encargan principalmente del transporte y de
@@ -3375,6 +3368,7 @@ invalid-cuit-length
 invalid-cuit-nondigit
 invalid-root
 invalid-envelope
+invalid-flat
 invalid-place-type
 ```
 
@@ -3390,7 +3384,7 @@ Ejecutar:
 python3 scripts/testdata/check_personas.py
 ```
 
-Actualmente cubre 16 casos.
+Actualmente cubre 17 casos.
 
 Este script permite revisar rápidamente la lógica Python, pero la evidencia
 principal del laboratorio continúa siendo el flujo real:
@@ -3582,7 +3576,7 @@ Buscar ejecuciones por lote:
 
 ```bash
 docker logs --tail 1000 bnh-flink-taskmanager 2>&1 \
-  | grep -E 'REST-VALID-001|REST-INVALID-CUIT-001|GRPC-VALID-001|GRPC-INVALID-CUIT-001'
+  | grep -E 'REST-VALID-001|REST-INVALID-CUIT-001|GRPC-VALID-001|GRPC-INVALID-CUIT-001|NIFI-VALID-001|NIFI-INVALID-CUIT-001'
 ```
 
 ---
@@ -3613,44 +3607,250 @@ docker compose run --rm \
   '
 ```
 
-Se comprobó que REST y gRPC, enviando la misma Persona, generan en Bronze:
+---
 
-* el mismo `registro`;
-* el mismo `estado_validacion`;
-* los mismos `errores`.
+## Validar NiFi
 
-La única diferencia esperada entre ambos mensajes es metadata de trazabilidad,
-por ejemplo `lote_id`.
+El flujo vigente está versionado en:
+
+```text
+nifi/flows/BNH_-_Personas_File_Ingestion.json
+```
+
+Pipeline:
+
+```text
+GetFile
+  → SplitRecord
+  → JoltTransformJSON
+  → EvaluateJsonPath
+  → PublishKafka
+failure → LogErrors
+```
+
+CSVReader usa `Use String Fields From Header` (`csv-header-derived`).
+Todos los campos se leen como string. No se usa inferencia automática de
+tipos, para preservar códigos con ceros a la izquierda (`001` permanece
+`"001"`).
+
+`JoltTransformJSON` convierte cada fila en el envelope común:
+
+```json
+{
+  "metadata": {
+    "jurisdiccion": "...",
+    "dominio": "...",
+    "lote_id": "..."
+  },
+  "registro": {
+    "...": "..."
+  }
+}
+```
+
+Kafka key:
+
+```text
+${persona.jurisdiccion}:${persona.id}
+```
+
+equivalente a `jurisdiccion:id_persona`.
+
+NiFi no duplica las validaciones de Persona: un CUIT inválido se publica
+igual que en REST/gRPC y Flink lo clasifica.
+
+### Importar el flujo
+
+Levantar NiFi:
+
+```bash
+docker compose up -d kafka nifi
+```
+
+Cuando `https://localhost:8443/nifi` responda:
+
+```bash
+python3 scripts/nifi/import_personas_flow.py
+```
+
+El script elimina un grupo previo con el mismo nombre, importa el JSON,
+habilita los Controller Services e inicia los procesadores.
+
+### Archivos de prueba
+
+```text
+scripts/testdata/nifi/NIFI-VALID-001.csv
+scripts/testdata/nifi/NIFI-INVALID-CUIT-001.csv
+scripts/testdata/nifi/NIFI-CANON-001.csv
+```
+
+Se pueden regenerar:
+
+```bash
+python3 scripts/testdata/personas.py --case valid --format csv --lote-id NIFI-VALID-001
+python3 scripts/testdata/personas.py --case invalid-cuit-nondigit --format csv --lote-id NIFI-INVALID-CUIT-001
+```
+
+Los campos opcionales vacíos se omiten en el CSV. Flink completa los
+campos conocidos faltantes como `null`.
+
+### Persona válida
+
+```bash
+cp scripts/testdata/nifi/NIFI-VALID-001.csv data/incoming/personas/
+```
+
+GetFile consulta la landing cada 5 segundos y elimina el archivo al
+incorporarlo (`Keep Source File = false`).
+
+Flink debe generar:
+
+```text
+estado_validacion = VALIDO
+```
+
+y conservar códigos como `"001"`.
+
+### CUIT inválido
+
+```bash
+cp scripts/testdata/nifi/NIFI-INVALID-CUIT-001.csv data/incoming/personas/
+```
+
+NiFi debe aceptar y publicar el mensaje.
+
+Flink debe generar:
+
+```text
+estado_validacion = INVALIDO
+registro.cuit debe contener solo digitos
+```
 
 ---
 
-## Estado de NiFi
+## Convergencia REST / gRPC / NiFi
 
-NiFi todavía utiliza el flujo inicial del laboratorio y debe alinearse al
-modelo actual.
+Los tres canales, enviando la misma Persona, deben generar en Bronze:
 
-El objetivo pendiente es:
+* el mismo `registro`;
+* el mismo `estado_validacion`;
+* los mismos `errores`;
+* la misma metadata común.
 
-```text
-archivo
-  ↓
-NiFi
-  ↓
-{metadata, registro}
-  ↓
-Kafka
-  ↓
-Flink
-  ↓
-Bronze
+El comparador ignora únicamente `lote_id`.
+
+```bash
+python3 scripts/testdata/personas.py --case valid \
+  | python3 -c '
+import sys,json
+data=json.load(sys.stdin)
+data["metadata"]["lote_id"]="REST-CANON-001"
+print(json.dumps(data, ensure_ascii=False))
+' \
+  | curl -s -w '\nHTTP %{http_code}\n' \
+      -X POST http://localhost:8000/personas \
+      -H "Content-Type: application/json" \
+      -d @-
+
+TOTAL_PERSONAS=1 \
+GRPC_CASE=valid \
+LOTE_ID=GRPC-CANON-001 \
+docker compose run --rm grpc-client
+
+cp scripts/testdata/nifi/NIFI-CANON-001.csv data/incoming/personas/
 ```
 
-NiFi debe publicar el mismo envelope que REST y gRPC y preservar
-identificadores/códigos como strings, evitando pérdida de información por
-inferencia automática de tipos CSV.
+Dump de Bronze (archivos `part-*`, sin `_tmp_`) y comparación:
 
-La compatibilidad de Flink con mensajes planos se mantiene temporalmente
-hasta completar esta migración.
+```bash
+python3 scripts/testdata/compare_bronze_personas.py \
+  /ruta/al/dump-bronze.jsonl \
+  --lotes REST-CANON-001 GRPC-CANON-001 NIFI-CANON-001
+```
+
+Se comprobó en el laboratorio que los tres lotes de una Persona convergen.
+
+---
+
+## Múltiples Personas por lote
+
+REST ya acepta `registros` en un único POST.
+gRPC ya envía un stream con `TOTAL_PERSONAS`.
+NiFi ya parte un CSV en un FlowFile por fila (`SplitRecord`, 1 registro).
+
+Lotes de cierre:
+
+```text
+REST-MULTI-001
+GRPC-MULTI-001
+NIFI-MULTI-001
+```
+
+Tres Personas: `P000001`, `P000002`, `P000003`. Todas válidas. Los códigos
+`001` van en las tres.
+
+### REST
+
+```bash
+python3 scripts/testdata/personas.py --case valid --lote-id REST-MULTI-001 --count 3 \
+  | curl -s -w '\nHTTP %{http_code}\n' \
+      -X POST http://localhost:8000/personas \
+      -H "Content-Type: application/json" \
+      -d @-
+```
+
+Esperado: `HTTP 202` y `cantidad_registros: 3`.
+
+### gRPC
+
+```bash
+TOTAL_PERSONAS=3 \
+GRPC_CASE=valid \
+LOTE_ID=GRPC-MULTI-001 \
+docker compose run --rm grpc-client
+```
+
+Esperado: `cantidad_recibida=3`.
+
+### NiFi
+
+```bash
+cp scripts/testdata/nifi/NIFI-MULTI-001.csv data/incoming/personas/
+```
+
+El CSV tiene 1 header y 3 filas. NiFi debe publicar 3 mensajes.
+
+Kafka key esperada por Persona:
+
+```text
+ARG-B:P000001
+ARG-B:P000002
+ARG-B:P000003
+```
+
+Comparar Bronze, Persona por Persona:
+
+```bash
+python3 scripts/testdata/compare_bronze_personas.py \
+  /ruta/al/dump-bronze.jsonl \
+  --lotes REST-MULTI-001 GRPC-MULTI-001 NIFI-MULTI-001 \
+  --esperadas 3
+```
+
+El comparador agrupa por `lote_id` + `id_persona`. Compara `registro`,
+`estado_validacion`, `errores` y metadata común, ignorando únicamente
+`lote_id`. Detecta faltantes, extras, duplicados y diferencias de contenido.
+
+Los tres canales de Persona publican `{metadata, registro}`. La
+compatibilidad de Flink con payload plano se eliminó. Un mensaje plano
+queda `INVALIDO` con:
+
+```text
+se requiere envelope {metadata, registro}
+```
+
+El productor histórico `apps/producer/producer.py` sigue siendo el smoke
+de etapas iniciales y no forma parte del contrato de Persona.
 
 ---
 

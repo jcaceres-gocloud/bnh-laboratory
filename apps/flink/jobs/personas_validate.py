@@ -109,16 +109,7 @@ def normalizar_estructura(data):
             "registro": dict(registro),
         }, []
 
-    # Compatibilidad temporal: NiFi todavía publica formato plano.
-    # Conservar hasta que NiFi emita envelope {metadata, registro}.
-    return {
-        "metadata": {
-            "jurisdiccion": data.get("jurisdiccion"),
-            "dominio": "persona",
-            "lote_id": None,
-        },
-        "registro": dict(data),
-    }, []
+    return None, ["se requiere envelope {metadata, registro}"]
 
 
 def completar_campos_persona(registro):

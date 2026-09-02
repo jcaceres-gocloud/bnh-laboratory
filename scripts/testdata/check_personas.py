@@ -70,6 +70,10 @@ CASOS = {
             "registro debe ser objeto",
         ],
     ),
+    "invalid-flat": (
+        "INVALIDO",
+        ["se requiere envelope {metadata, registro}"],
+    ),
     "invalid-place-type": (
         "INVALIDO",
         ["registro.lugar_nacimiento debe ser texto"],

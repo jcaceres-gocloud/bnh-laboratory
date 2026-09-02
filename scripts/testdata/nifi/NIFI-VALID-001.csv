@@ -1,0 +1,2 @@
+jurisdiccion,dominio,lote_id,id_persona,fecha_nacimiento,cuit,c_documento,nro_documento,c_pais_nacimiento,c_provincia_nacimiento,c_departamento_nacimiento,c_localidad_nacimiento,c_municipio_nacimiento,lugar_nacimiento,c_fallecido,c_es_indigena
+ARG-B,persona,NIFI-VALID-001,P000001,1990-05-10,20123456789,DNI,12345678,ARG,B,001,001,001,Buenos Aires,N,N
