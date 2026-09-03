@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package bnh.organizaciones.v1;
+
+
+message Metadata {
+  string jurisdiccion = 1;
+  string dominio = 2;
+  string lote_id = 3;
+}
+
+
+// Transporte del registro. La validación de Organizacion la hace Flink.
+// optional permite omitir campos; proto3 no puede representar ints/bools
+// ni JSON null, a diferencia de REST/Kafka.
+message Organizacion {
+  optional string id_organizacion = 1;
+  optional string nombre = 2;
+  optional string descripcion = 3;
+  optional string c_organizacion = 4;
+  optional string fecha_alta = 5;
+  optional string fecha_baja = 6;
+}
+
+
+message CargaOrganizacionRequest {
+  Metadata metadata = 1;
+  Organizacion registro = 2;
+}
+
+
+message ResultadoCarga {
+  string lote_id = 1;
+  int32 cantidad_recibida = 2;
+  string estado = 3;
+}
+
+
+service OrganizacionesService {
+  rpc EnviarOrganizaciones(stream CargaOrganizacionRequest) returns (ResultadoCarga);
+}

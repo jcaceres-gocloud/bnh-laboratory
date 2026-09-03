@@ -1,0 +1,2 @@
+jurisdiccion,dominio,lote_id,id_organizacion,nombre,descripcion,c_organizacion,fecha_alta
+ARG-B,organizacion,NIFI-ORG-INVALID-001,ORG000001,Hospital Central,Organizacion de prueba del laboratorio,01,2020-99-99

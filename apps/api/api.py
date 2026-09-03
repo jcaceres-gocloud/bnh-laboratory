@@ -53,7 +53,39 @@ class PersonasPayload(BaseModel):
         return self
 
 
+class Organizacion(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id_organizacion: Any = None
+    nombre: Any = None
+    descripcion: Any = None
+    c_organizacion: Any = None
+    fecha_alta: Any = None
+    fecha_baja: Any = None
+
+
+class OrganizacionesPayload(BaseModel):
+    metadata: Metadata
+    registro: Organizacion | None = None
+    registros: list[Organizacion] | None = None
+
+    @model_validator(mode="after")
+    def exigir_registro(self):
+        if self.registro is None and self.registros is None:
+            raise ValueError("se requiere registro o registros")
+        return self
+
+
 def personas_del_payload(payload: PersonasPayload) -> list[Persona]:
+    if payload.registros is not None:
+        return payload.registros
+
+    return [payload.registro]
+
+
+def organizaciones_del_payload(
+    payload: OrganizacionesPayload,
+) -> list[Organizacion]:
     if payload.registros is not None:
         return payload.registros
 
@@ -93,4 +125,35 @@ def crear_personas(payload: PersonasPayload):
         "status": "accepted",
         "lote_id": payload.metadata.lote_id,
         "cantidad_registros": len(personas),
+    }
+
+
+@app.post("/organizaciones", status_code=202)
+def crear_organizaciones(payload: OrganizacionesPayload):
+    organizaciones = organizaciones_del_payload(payload)
+    metadata = payload.metadata.model_dump()
+
+    for organizacion in organizaciones:
+        registro = organizacion.model_dump(exclude_unset=True)
+        evento = {
+            "metadata": metadata,
+            "registro": registro,
+        }
+
+        id_organizacion = registro.get("id_organizacion")
+        if id_organizacion is None:
+            id_organizacion = ""
+
+        producer.produce(
+            topic="bnh.organizaciones",
+            key=f"{payload.metadata.jurisdiccion}:{id_organizacion}",
+            value=json.dumps(evento, ensure_ascii=False),
+        )
+
+    producer.flush()
+
+    return {
+        "status": "accepted",
+        "lote_id": payload.metadata.lote_id,
+        "cantidad_registros": len(organizaciones),
     }

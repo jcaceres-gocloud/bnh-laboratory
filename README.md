@@ -3876,3 +3876,691 @@ Todavía no se implementan como validaciones duras:
 
 Estas reglas requieren definiciones funcionales o catálogos oficiales y no se
 consideran confirmadas únicamente por aparecer en relevamientos/documentación.
+
+---
+---
+
+## Validación e integración de Organización hasta Bronze
+
+### Objetivo
+
+El laboratorio implementa y valida el flujo de ingestión de la entidad
+`Organizacion` hasta la capa Bronze, siguiendo el mismo patrón ya validado
+para Persona.
+
+El mapa de trabajo de esta etapa es el DER v0.4. No se intentó resolver
+integraciones con padrón ni otras fuentes externas.
+
+La arquitectura probada es:
+
+```text
+REST ──┐
+       │
+gRPC ──┼──> Kafka (`bnh.organizaciones`) ──> PyFlink ──> Bronze (S3 compatible)
+       │
+NiFi ──┘
+```
+
+Estado actual:
+
+* REST → Kafka → Flink → Bronze: validado.
+* gRPC → Kafka → Flink → Bronze: validado.
+* NiFi → Kafka → Flink → Bronze: validado.
+* REST, gRPC y NiFi publican el envelope `{metadata, registro}` en `bnh.organizaciones`.
+* Los tres canales producen el mismo registro canónico en Bronze.
+* `lote_id` es la única diferencia esperada.
+
+La validación técnica común de Organización se centraliza en Flink.
+Los canales de ingreso se encargan del transporte y de construir el envelope.
+
+El alcance de esta etapa termina en Bronze.
+
+---
+
+### Modelo actual de Organización
+
+El registro normalizado contiene siempre los siguientes campos conocidos:
+
+```text
+id_organizacion
+nombre
+descripcion
+c_organizacion
+fecha_alta
+fecha_baja
+```
+
+Obligatorios:
+
+```text
+id_organizacion
+nombre
+c_organizacion
+fecha_alta
+```
+
+Opcionales:
+
+```text
+descripcion
+fecha_baja
+```
+
+Flink genera una representación canónica del registro:
+
+* los 6 campos conocidos están siempre presentes;
+* los campos opcionales ausentes quedan como `null`;
+* los campos adicionales recibidos se conservan;
+* `id_organizacion` y `c_organizacion` numéricos se normalizan a `string`
+  (`bool` no se trata como `int`).
+
+Ejemplo:
+
+```json
+{
+  "estado_validacion": "VALIDO",
+  "errores": [],
+  "metadata": {
+    "jurisdiccion": "ARG-B",
+    "dominio": "organizacion",
+    "lote_id": "REST-ORG-CANON-001"
+  },
+  "registro": {
+    "id_organizacion": "ORG000001",
+    "nombre": "Hospital Central",
+    "descripcion": "Organizacion de prueba del laboratorio",
+    "c_organizacion": "01",
+    "fecha_alta": "2020-01-15",
+    "fecha_baja": null
+  }
+}
+```
+
+---
+
+### Responsabilidades por componente
+
+#### REST / gRPC
+
+Los canales de entrada:
+
+* reciben el registro;
+* conservan metadata;
+* construyen el envelope;
+* publican en Kafka;
+* generan la key Kafka a partir de `jurisdiccion:id_organizacion`.
+
+No duplican las reglas de validación implementadas en Flink.
+
+Por ejemplo, una `fecha_alta` inválida como:
+
+```text
+2020-99-99
+```
+
+puede ser aceptada por REST/gRPC y transportada a Kafka.
+
+Flink es quien posteriormente la clasifica como `INVALIDO`.
+
+REST acepta un registro:
+
+```json
+{
+  "metadata": { "...": "..." },
+  "registro": { "...": "..." }
+}
+```
+
+o un lote:
+
+```json
+{
+  "metadata": { "...": "..." },
+  "registros": [ { "...": "..." } ]
+}
+```
+
+Cada Organización se publica como un mensaje Kafka independiente.
+
+gRPC usa client streaming. El contrato de Persona no cambia. Organización
+expone un servicio propio en el mismo servidor:
+
+```text
+OrganizacionesService.EnviarOrganizaciones
+```
+
+#### Kafka
+
+Topic:
+
+```text
+bnh.organizaciones
+```
+
+El laboratorio utiliza 3 particiones y replication factor 1.
+
+Kafka key:
+
+```text
+jurisdiccion:id_organizacion
+```
+
+ejemplo:
+
+```text
+ARG-B:ORG000001
+```
+
+Kafka no aplica reglas de validación de Organización.
+
+#### Flink
+
+Flink centraliza parsing, validación estructural, normalización,
+canonicalización, validaciones técnicas, `estado_validacion`, errores y
+persistencia hacia Bronze.
+
+Job:
+
+```text
+BNH - Organizaciones Normalize Validate and Bronze
+```
+
+Archivo:
+
+```text
+apps/flink/jobs/organizaciones_validate.py
+```
+
+Es un job específico. No se convirtió `personas_validate.py` en un
+framework genérico.
+
+Si Persona y Organización corren al mismo tiempo, el TaskManager del
+laboratorio ya tiene 2 task slots.
+
+#### Bronze
+
+```text
+s3://bnh-bronze/organizaciones/
+```
+
+Durante una escritura pueden aparecer archivos temporales `_tmp_`.
+Eso es comportamiento normal del FileSink.
+
+---
+
+## Casos sintéticos de Organización
+
+```text
+scripts/testdata/organizaciones.py
+```
+
+Casos disponibles:
+
+```text
+valid
+missing-id
+missing-name
+missing-type
+missing-start-date
+numeric-identifiers
+numeric-type-code
+invalid-start-date
+invalid-end-date
+invalid-name-type
+invalid-description-type
+invalid-root
+invalid-envelope
+invalid-flat
+```
+
+Smoke check:
+
+```bash
+python3 scripts/testdata/check_organizaciones.py
+```
+
+Actualmente cubre 14 casos.
+
+La evidencia principal del laboratorio continúa siendo el flujo real:
+
+```text
+canal → Kafka → Flink → Bronze
+```
+
+---
+
+## Levantar el flujo Organización
+
+Ejecutar desde la raíz del repositorio.
+
+Persona puede seguir corriendo en paralelo. No es necesario detenerla.
+
+### Infraestructura mínima
+
+```bash
+docker compose up -d \
+  kafka \
+  minio \
+  minio-init \
+  flink-jobmanager \
+  flink-taskmanager
+```
+
+### Crear el topic Kafka
+
+```bash
+docker exec bnh-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --create \
+  --if-not-exists \
+  --topic bnh.organizaciones \
+  --partitions 3 \
+  --replication-factor 1
+```
+
+### Ejecutar el job de Flink
+
+```bash
+docker exec bnh-flink-jobmanager \
+  flink run -d \
+  -py /opt/flink/jobs/organizaciones_validate.py
+```
+
+Verificar:
+
+```bash
+curl -s http://localhost:8081/jobs/overview
+```
+
+Debe existir un job:
+
+```text
+BNH - Organizaciones Normalize Validate and Bronze
+```
+
+en estado:
+
+```text
+RUNNING
+```
+
+---
+
+## Validar REST
+
+```bash
+docker compose build api
+docker compose up -d api
+```
+
+### Organización válida
+
+```bash
+python3 scripts/testdata/organizaciones.py --case valid \
+  --lote-id REST-ORG-VALID-001 \
+  | curl -s -w '\nHTTP %{http_code}\n' \
+      -X POST http://localhost:8000/organizaciones \
+      -H "Content-Type: application/json" \
+      -d @-
+```
+
+Esperado:
+
+```text
+HTTP 202
+```
+
+y posteriormente Flink:
+
+```text
+estado_validacion = VALIDO
+```
+
+### Organización con fecha_alta inválida
+
+```bash
+python3 scripts/testdata/organizaciones.py --case invalid-start-date \
+  --lote-id REST-ORG-INVALID-001 \
+  | curl -s -w '\nHTTP %{http_code}\n' \
+      -X POST http://localhost:8000/organizaciones \
+      -H "Content-Type: application/json" \
+      -d @-
+```
+
+REST debe aceptar el registro (`HTTP 202`).
+
+Flink debe generar:
+
+```text
+estado_validacion = INVALIDO
+registro.fecha_alta invalida
+```
+
+---
+
+## Validar gRPC
+
+El contrato se genera con el mismo procedimiento que Persona:
+
+```bash
+docker run --rm \
+  -v "$PWD:/workspace" \
+  -w /workspace \
+  python:3.12-slim \
+  sh -c "pip install --no-cache-dir grpcio-tools==1.83.0 && \
+  python -m grpc_tools.protoc \
+    -I contracts/grpc \
+    --python_out=apps/grpc/generated \
+    --grpc_python_out=apps/grpc/generated \
+    contracts/grpc/organizaciones/v1/organizaciones.proto"
+```
+
+```bash
+docker compose build grpc-server grpc-client
+docker compose up -d grpc-server
+```
+
+### Organización válida
+
+```bash
+TOTAL_ORGANIZACIONES=1 \
+GRPC_CASE=valid \
+LOTE_ID=GRPC-ORG-VALID-001 \
+docker compose run --rm grpc-client python organizaciones_client.py
+```
+
+### fecha_alta inválida
+
+```bash
+TOTAL_ORGANIZACIONES=1 \
+GRPC_CASE=invalid-start-date \
+LOTE_ID=GRPC-ORG-INVALID-001 \
+docker compose run --rm grpc-client python organizaciones_client.py
+```
+
+gRPC debe aceptar ambos registros.
+
+Flink debe producir respectivamente:
+
+```text
+GRPC-ORG-VALID-001
+→ VALIDO
+```
+
+y:
+
+```text
+GRPC-ORG-INVALID-001
+→ INVALIDO
+→ registro.fecha_alta invalida
+```
+
+El cliente de Persona (`client.py` / `TOTAL_PERSONAS`) no cambia.
+
+---
+
+## Verificar Flink
+
+```bash
+docker logs --tail 1000 bnh-flink-taskmanager 2>&1 \
+  | grep -E 'REST-ORG-|GRPC-ORG-|NIFI-ORG-'
+```
+
+---
+
+## Verificar Bronze
+
+```bash
+docker compose run --rm \
+  --entrypoint /bin/sh \
+  minio-init \
+  -c '
+    mc alias set bnh http://minio:9000 bnhadmin BnhMinioLaboratory1234 >/dev/null &&
+    mc ls --recursive bnh/bnh-bronze/organizaciones
+  '
+```
+
+---
+
+## Validar NiFi
+
+El flujo está versionado en:
+
+```text
+nifi/flows/BNH_-_Organizaciones_File_Ingestion.json
+```
+
+Pipeline:
+
+```text
+GetFile
+  → SplitRecord
+  → JoltTransformJSON
+  → EvaluateJsonPath
+  → PublishKafka
+failure → LogErrors
+```
+
+Landing:
+
+```text
+data/incoming/organizaciones/
+```
+
+CSVReader usa `Use String Fields From Header` (`csv-header-derived`).
+Todos los campos se leen como string. No se usa inferencia automática de
+tipos.
+
+`JoltTransformJSON` convierte cada fila en el envelope común
+`{metadata, registro}`.
+
+EvaluateJsonPath:
+
+```text
+organizacion.jurisdiccion = $.metadata.jurisdiccion
+organizacion.id           = $.registro.id_organizacion
+```
+
+Kafka key:
+
+```text
+${organizacion.jurisdiccion}:${organizacion.id}
+```
+
+NiFi no duplica las validaciones de Organización.
+
+### Importar el flujo
+
+```bash
+docker compose up -d kafka nifi
+```
+
+Cuando `https://localhost:8443/nifi` responda:
+
+```bash
+python3 scripts/nifi/import_organizaciones_flow.py
+```
+
+El script elimina un grupo previo con el mismo nombre, importa el JSON,
+habilita los Controller Services e inicia los procesadores.
+
+El importador usa TLS inseguro únicamente porque NiFi del laboratorio
+expone un certificado autofirmado. Eso no es una definición productiva.
+
+El importador de Persona no se modificó.
+
+### Archivos de prueba
+
+```text
+scripts/testdata/nifi/NIFI-ORG-VALID-001.csv
+scripts/testdata/nifi/NIFI-ORG-INVALID-001.csv
+scripts/testdata/nifi/NIFI-ORG-CANON-001.csv
+scripts/testdata/nifi/NIFI-ORG-MULTI-001.csv
+```
+
+Se pueden regenerar:
+
+```bash
+python3 scripts/testdata/organizaciones.py --case valid --format csv --lote-id NIFI-ORG-VALID-001
+python3 scripts/testdata/organizaciones.py --case invalid-start-date --format csv --lote-id NIFI-ORG-INVALID-001
+python3 scripts/testdata/organizaciones.py --case valid --format csv --lote-id NIFI-ORG-CANON-001
+python3 scripts/testdata/organizaciones.py --case valid --format csv --lote-id NIFI-ORG-MULTI-001 --count 3
+```
+
+Los campos opcionales vacíos se omiten en el CSV. Flink completa los
+campos conocidos faltantes como `null`.
+
+### Organización válida
+
+```bash
+cp scripts/testdata/nifi/NIFI-ORG-VALID-001.csv data/incoming/organizaciones/
+```
+
+Flink debe generar:
+
+```text
+estado_validacion = VALIDO
+```
+
+### fecha_alta inválida
+
+```bash
+cp scripts/testdata/nifi/NIFI-ORG-INVALID-001.csv data/incoming/organizaciones/
+```
+
+NiFi debe aceptar y publicar el mensaje.
+
+Flink debe generar:
+
+```text
+estado_validacion = INVALIDO
+registro.fecha_alta invalida
+```
+
+---
+
+## Convergencia REST / gRPC / NiFi
+
+Los tres canales, enviando la misma Organización, deben generar en Bronze:
+
+* el mismo `registro`;
+* el mismo `estado_validacion`;
+* los mismos `errores`;
+* la misma metadata común.
+
+El comparador ignora únicamente `lote_id`. Indexa `lote_id` → `id_organizacion`.
+
+```bash
+python3 scripts/testdata/organizaciones.py --case valid --lote-id REST-ORG-CANON-001 \
+  | curl -s -w '\nHTTP %{http_code}\n' \
+      -X POST http://localhost:8000/organizaciones \
+      -H "Content-Type: application/json" \
+      -d @-
+
+TOTAL_ORGANIZACIONES=1 \
+GRPC_CASE=valid \
+LOTE_ID=GRPC-ORG-CANON-001 \
+docker compose run --rm grpc-client python organizaciones_client.py
+
+cp scripts/testdata/nifi/NIFI-ORG-CANON-001.csv data/incoming/organizaciones/
+```
+
+```bash
+python3 scripts/testdata/compare_bronze_organizaciones.py \
+  /ruta/al/dump-bronze.jsonl \
+  --lotes REST-ORG-CANON-001 GRPC-ORG-CANON-001 NIFI-ORG-CANON-001
+```
+
+Se comprobó en el laboratorio que los tres lotes de una Organización convergen.
+
+---
+
+## Múltiples Organizaciones por lote
+
+Lotes de cierre:
+
+```text
+REST-ORG-MULTI-001
+GRPC-ORG-MULTI-001
+NIFI-ORG-MULTI-001
+```
+
+Tres Organizaciones: `ORG000001`, `ORG000002`, `ORG000003`. Todas válidas.
+
+### REST
+
+```bash
+python3 scripts/testdata/organizaciones.py --case valid --lote-id REST-ORG-MULTI-001 --count 3 \
+  | curl -s -w '\nHTTP %{http_code}\n' \
+      -X POST http://localhost:8000/organizaciones \
+      -H "Content-Type: application/json" \
+      -d @-
+```
+
+Esperado: `HTTP 202` y `cantidad_registros: 3`.
+
+### gRPC
+
+```bash
+TOTAL_ORGANIZACIONES=3 \
+GRPC_CASE=valid \
+LOTE_ID=GRPC-ORG-MULTI-001 \
+docker compose run --rm grpc-client python organizaciones_client.py
+```
+
+Esperado: `cantidad_recibida=3`.
+
+### NiFi
+
+```bash
+cp scripts/testdata/nifi/NIFI-ORG-MULTI-001.csv data/incoming/organizaciones/
+```
+
+El CSV tiene 1 header y 3 filas. NiFi debe publicar 3 mensajes.
+
+Kafka key esperada por Organización:
+
+```text
+ARG-B:ORG000001
+ARG-B:ORG000002
+ARG-B:ORG000003
+```
+
+```bash
+python3 scripts/testdata/compare_bronze_organizaciones.py \
+  /ruta/al/dump-bronze.jsonl \
+  --lotes REST-ORG-MULTI-001 GRPC-ORG-MULTI-001 NIFI-ORG-MULTI-001 \
+  --esperadas 3
+```
+
+El comparador agrupa por `lote_id` + `id_organizacion`. Compara `registro`,
+`estado_validacion`, `errores` y metadata común, ignorando únicamente
+`lote_id`. Detecta faltantes, extras, duplicados y diferencias de contenido.
+
+Los tres canales de Organización publican `{metadata, registro}`.
+Un mensaje plano queda `INVALIDO` con:
+
+```text
+se requiere envelope {metadata, registro}
+```
+
+---
+
+## Reglas deliberadamente fuera de alcance actual
+
+Todavía no se implementan:
+
+* valores permitidos de `c_organizacion`;
+* existencia en `organizacion_tipo`;
+* validación de jurisdicciones contra catálogo;
+* `fecha_baja >= fecha_alta`;
+* longitud o formato específico de `id_organizacion`;
+* unicidad global;
+* relaciones con establecimientos, grupos, `unidad_servicio` o localización;
+* `organizacion_agrupacion`, `agrupacion`, `componente_organizacional`,
+  `relacion_organizacional`;
+* validaciones contra padrón u otras fuentes externas.
+
+Esos puntos quedan pendientes de definición o de acceso con el cliente.
+No se documentan como confirmados.
+

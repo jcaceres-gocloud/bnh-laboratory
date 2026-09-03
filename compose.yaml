@@ -150,6 +150,7 @@ services:
 
     environment:
       TOTAL_PERSONAS: ${TOTAL_PERSONAS:-10}
+      TOTAL_ORGANIZACIONES: ${TOTAL_ORGANIZACIONES:-10}
       GRPC_CASE: ${GRPC_CASE:-valid}
       LOTE_ID: ${LOTE_ID:-}
 
