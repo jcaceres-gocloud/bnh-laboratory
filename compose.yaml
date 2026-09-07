@@ -261,6 +261,70 @@ services:
         mc mb --ignore-existing bnh/bnh-bronze
     restart: "no"
 
+  postgres-dw:
+    image: postgres:17
+    container_name: bnh-postgres-dw
+    hostname: postgres-dw
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U bnh -d bnh_dw",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+    ports:
+      - "5433:5432"
+
+    environment:
+      POSTGRES_DB: bnh_dw
+      POSTGRES_USER: bnh
+      POSTGRES_PASSWORD: BnhLaboratory1234
+
+    volumes:
+      - postgres_dw_data:/var/lib/postgresql/data
+      - ./docker/postgres-dw/init:/docker-entrypoint-initdb.d:ro
+
+    restart: "no"
+
+  spark-master:
+    image: spark:4.1.2-python3
+    container_name: bnh-spark-master
+    hostname: spark-master
+
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+
+    ports:
+      - "7077:7077"
+      - "8082:8080"
+
+    restart: "no"
+
+  spark-worker:
+    image: spark:4.1.2-python3
+    container_name: bnh-spark-worker
+    hostname: spark-worker
+
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2g
+
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+
+    depends_on:
+      - spark-master
+
+    restart: "no"
+
 volumes:
   kafka_data:
   nifi_conf:
@@ -272,3 +336,4 @@ volumes:
   prometheus_data:
   grafana_data:
   minio_data:
+  postgres_dw_data:
