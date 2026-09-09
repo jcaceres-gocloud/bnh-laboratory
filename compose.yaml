@@ -1,3 +1,18 @@
+x-ozone-common: &ozone-common
+  image: apache/ozone:2.2.1-slim
+  environment: &ozone-environment
+    OZONE-SITE.XML_hdds.datanode.dir: /data/hdds
+    OZONE-SITE.XML_ozone.metadata.dirs: /data/metadata
+    OZONE-SITE.XML_ozone.om.address: ozone-om
+    OZONE-SITE.XML_ozone.om.http-address: ozone-om:9874
+    OZONE-SITE.XML_ozone.replication: "1"
+    OZONE-SITE.XML_hdds.scm.safemode.min.datanode: "1"
+    OZONE-SITE.XML_ozone.scm.block.client.address: ozone-scm
+    OZONE-SITE.XML_ozone.scm.client.address: ozone-scm
+    OZONE-SITE.XML_ozone.scm.datanode.id.dir: /data/metadata
+    OZONE-SITE.XML_ozone.scm.names: ozone-scm
+    no_proxy: ozone-om,ozone-scm,ozone-s3g,localhost,127.0.0.1
+
 services:
   kafka:
     image: apache/kafka:4.3.0
@@ -204,7 +219,7 @@ services:
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
-        s3.endpoint: http://minio:9000
+        s3.endpoint: http://ozone-s3g:9878
         s3.access-key: bnhadmin
         s3.secret-key: BnhMinioLaboratory1234
         s3.path.style.access: true
@@ -225,40 +240,10 @@ services:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 2
-        s3.endpoint: http://minio:9000
+        s3.endpoint: http://ozone-s3g:9878
         s3.access-key: bnhadmin
         s3.secret-key: BnhMinioLaboratory1234
         s3.path.style.access: true
-    restart: "no"
-
-  minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
-    container_name: bnh-minio
-    hostname: minio
-    command: server /data --console-address ":9001"
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    environment:
-      MINIO_ROOT_USER: bnhadmin
-      MINIO_ROOT_PASSWORD: BnhMinioLaboratory1234
-    volumes:
-      - minio_data:/data
-    restart: "no"
-
-  minio-init:
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
-    container_name: bnh-minio-init
-    depends_on:
-      - minio
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        until mc alias set bnh http://minio:9000 bnhadmin BnhMinioLaboratory1234; do
-          sleep 1
-        done
-        mc mb --ignore-existing bnh/bnh-bronze
     restart: "no"
 
   postgres-dw:
@@ -305,6 +290,8 @@ services:
       - "8082:8080"
 
     restart: "no"
+    volumes:
+      - ./apps/spark/jobs:/opt/spark/jobs:ro
 
   spark-worker:
     image: spark:4.1.2-python3
@@ -325,6 +312,87 @@ services:
 
     restart: "no"
 
+  ozone-scm:
+    <<: *ozone-common
+    container_name: bnh-ozone-scm
+    hostname: ozone-scm
+    command: ["ozone", "scm"]
+    environment:
+      <<: *ozone-environment
+      ENSURE_SCM_INITIALIZED: /data/metadata/scm/current/VERSION
+    volumes:
+      - ozone_scm_data:/data
+    ports:
+      - "9876:9876"
+    restart: "no"
+
+  ozone-om:
+    <<: *ozone-common
+    container_name: bnh-ozone-om
+    hostname: ozone-om
+    command: ["ozone", "om"]
+    environment:
+      <<: *ozone-environment
+      ENSURE_OM_INITIALIZED: /data/metadata/om/current/VERSION
+      WAITFOR: ozone-scm:9876
+      CORE-SITE.XML_hadoop.proxyuser.hadoop.hosts: "*"
+      CORE-SITE.XML_hadoop.proxyuser.hadoop.groups: "*"
+    volumes:
+      - ozone_om_data:/data
+    depends_on:
+      - ozone-scm
+    ports:
+      - "9874:9874"
+    restart: "no"
+
+  ozone-datanode:
+    <<: *ozone-common
+    container_name: bnh-ozone-datanode
+    hostname: ozone-datanode
+    command: ["ozone", "datanode"]
+    volumes:
+      - ozone_datanode_data:/data
+    depends_on:
+      - ozone-scm
+      - ozone-om
+    restart: "no"
+
+  ozone-s3g:
+    <<: *ozone-common
+    container_name: bnh-ozone-s3g
+    hostname: ozone-s3g
+    command: ["ozone", "s3g"]
+    depends_on:
+      - ozone-scm
+      - ozone-om
+      - ozone-datanode
+    ports:
+      - "9878:9878"
+    restart: "no"
+
+  ozone-init:
+    <<: *ozone-common
+    container_name: bnh-ozone-init
+    hostname: ozone-init
+    depends_on:
+      - ozone-om
+      - ozone-scm
+      - ozone-datanode
+    environment:
+      <<: *ozone-environment
+      WAITFOR: ozone-om:9874
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        until ozone sh volume list >/dev/null 2>&1; do
+          sleep 1
+        done
+        ozone sh volume info /s3v >/dev/null 2>&1 || ozone sh volume create /s3v
+        ozone sh bucket info /s3v/bnh-bronze >/dev/null 2>&1 || ozone sh bucket create --layout OBJECT_STORE /s3v/bnh-bronze
+    restart: "no"
+
 volumes:
   kafka_data:
   nifi_conf:
@@ -337,3 +405,6 @@ volumes:
   grafana_data:
   minio_data:
   postgres_dw_data:
+  ozone_scm_data:
+  ozone_om_data:
+  ozone_datanode_data:
