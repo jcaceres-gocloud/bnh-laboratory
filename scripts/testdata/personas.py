@@ -144,13 +144,11 @@ def generar_caso(nombre):
 
     payload = persona_base()
 
-    campo = CASOS_SIN_CAMPO.get(nombre)
-    if campo:
+    if campo := CASOS_SIN_CAMPO.get(nombre):
         payload["registro"].pop(campo)
         return payload
 
-    cambios = REGISTRO_OVERRIDES.get(nombre)
-    if cambios:
+    if cambios := REGISTRO_OVERRIDES.get(nombre):
         payload["registro"].update(cambios)
         return payload
 
@@ -161,9 +159,7 @@ def generar_caso(nombre):
 
 
 def _valor_csv(valor):
-    if valor is None:
-        return ""
-    return valor
+    return "" if valor is None else valor
 
 
 def payload_a_fila_csv(payload):

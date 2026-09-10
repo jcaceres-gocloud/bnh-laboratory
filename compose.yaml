@@ -370,6 +370,25 @@ services:
       - "9878:9878"
     restart: "no"
 
+  ozone-recon:
+    <<: *ozone-common
+    container_name: bnh-ozone-recon
+    hostname: ozone-recon
+    command: ["ozone", "recon"]
+    environment:
+      <<: *ozone-environment
+      OZONE-SITE.XML_ozone.recon.db.dir: /data/recon
+      OZONE-SITE.XML_ozone.recon.om.db.dir: /data/recon/om
+    volumes:
+      - ozone_recon_data:/data
+    depends_on:
+      - ozone-scm
+      - ozone-om
+      - ozone-datanode
+    ports:
+      - "9888:9888"
+    restart: "no"
+
   ozone-init:
     <<: *ozone-common
     container_name: bnh-ozone-init
@@ -408,3 +427,4 @@ volumes:
   ozone_scm_data:
   ozone_om_data:
   ozone_datanode_data:
+  ozone_recon_data:
