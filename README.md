@@ -1,6 +1,144 @@
 # bnh-laboratory
 Laboratory from bnh infrastructure
 
+> **Lectura recomendada:** las Etapas 1 a 5 muestran la evolución incremental del
+> laboratorio. Las secciones de validación de Persona/Organización y las Etapas 6
+> y 7 describen el flujo técnico vigente.
+>
+> El laboratorio actual llega hasta `Processed`. `Curated`, Data Marts y Airflow
+> todavía no forman parte del flujo validado.
+
+## Estado actual del laboratorio
+
+Arquitectura técnica validada:
+
+```text
+REST ──┐
+       │
+gRPC ──┼──> Kafka ──> PyFlink ──> Apache Ozone / Bronze ──> Apache Spark ──> PostgreSQL DW
+       │                                                   │
+NiFi ──┘                                                   └──> schema processed
+```
+
+Entidades cerradas hasta `Processed`:
+
+```text
+Persona        ✅
+Organización   ✅
+```
+
+Responsabilidad principal de cada componente:
+
+| Componente | Responsabilidad en el laboratorio |
+|---|---|
+| REST / gRPC / NiFi | Canales de ingreso |
+| Kafka | Transporte y desacoplamiento |
+| PyFlink | Parsing, normalización, canonicalización y validaciones técnicas |
+| Apache Ozone | Persistencia Bronze mediante interfaz S3 |
+| Apache Spark | Transformación batch de Bronze a Processed |
+| PostgreSQL DW | Persistencia relacional de Processed |
+| DBeaver | Inspección manual del DW |
+| Prometheus / Grafana | Base de observabilidad del laboratorio |
+| Airflow | Pendiente: orquestación de jobs Spark |
+
+### Servicios y puertos principales
+
+| Servicio | Uso | Puerto host |
+|---|---|---:|
+| Kafka | Broker | `9092` |
+| API REST | Ingesta HTTP | `8000` |
+| gRPC server | Ingesta gRPC | `50051` |
+| NiFi | UI / ingesta de archivos | `8443` |
+| Flink JobManager | UI | `8081` |
+| Ozone OM | UI/API administrativa | `9874` |
+| Ozone SCM | UI/API administrativa | `9876` |
+| Ozone S3 Gateway | API compatible S3 | `9878` |
+| Spark Master | Cluster | `7077` |
+| Spark Master UI | UI | `8082` |
+| PostgreSQL DW | DW | `5433` |
+
+Los nombres y recursos corresponden al laboratorio local. No constituyen una
+topología productiva.
+
+## Arranque estándar del laboratorio
+
+El laboratorio se detiene antes de apagar el equipo. Por lo tanto, al iniciar
+una nueva sesión se debe asumir que los contenedores están detenidos.
+
+### 1. Levantar el stack
+
+```bash
+docker compose up -d
+```
+
+### 2. Verificar servicios
+
+```bash
+docker compose ps
+```
+
+Los servicios persistentes principales deberían quedar en estado `Up`.
+Algunos servicios de inicialización o clientes de prueba pueden finalizar con
+código `0` porque son procesos one-shot.
+
+### 3. Esperar que Ozone pueda aceptar escrituras
+
+```bash
+docker exec bnh-ozone-scm \
+  ozone admin safemode wait -t 60
+```
+
+Resultado esperado:
+
+```text
+SCM is out of safe mode.
+```
+
+Si SCM permanece en Safe Mode, no continuar con pruebas de escritura hasta
+resolverlo.
+
+### 4. Verificar los jobs Flink
+
+Los contenedores Flink pueden estar `Up` sin que los jobs de Persona y
+Organización estén ejecutándose.
+
+```bash
+curl -s http://localhost:8081/jobs/overview
+```
+
+Si faltan, enviarlos nuevamente:
+
+```bash
+docker exec bnh-flink-jobmanager \
+  flink run -d \
+  -py /opt/flink/jobs/personas_validate.py
+```
+
+```bash
+docker exec bnh-flink-jobmanager \
+  flink run -d \
+  -py /opt/flink/jobs/organizaciones_validate.py
+```
+
+### 5. Detener sin borrar datos
+
+```bash
+docker compose down
+```
+
+Esto elimina contenedores y red, pero conserva los volúmenes.
+
+### Reinicio destructivo
+
+```bash
+docker compose down -v
+```
+
+> Usar `-v` únicamente cuando se quiera eliminar deliberadamente el estado
+> persistido de Kafka, NiFi, Ozone, PostgreSQL y demás servicios con volumen.
+
+---
+
 
 ## Etapa 1 — Apache Kafka
 
@@ -2822,343 +2960,653 @@ estable al aumentar el volumen antes de incorporar procesamiento con Flink.
 
 ---
 
-## Etapa 6 — Capa Bronze con Apache Flink y MinIO
+## Etapa 6 — Capa Bronze con Apache Flink y Apache Ozone
 
-El laboratorio incorpora una primera implementación de la capa Bronze utilizando
-Apache Flink para el procesamiento de eventos y MinIO como almacenamiento
-compatible con S3.
+En esta etapa el laboratorio utiliza **Apache Flink 2.1.1** para procesar los
+eventos provenientes de Kafka y **Apache Ozone 2.2.1** como almacenamiento
+activo de la capa Bronze.
 
-El objetivo de esta etapa es validar el flujo técnico completo desde los canales
-de ingesta hasta la persistencia, sin implementar todavía lógica de negocio
-educativa compleja ni persistencia analítica en PostgreSQL.
+El objetivo es validar:
 
-### Flujo de la etapa
+* escritura desde Flink hacia almacenamiento compatible con S3;
+* persistencia del envelope canónico `{metadata, registro}`;
+* conservación de registros `VALIDO` e `INVALIDO`;
+* checkpointing y finalización de archivos de `FileSink`;
+* acceso a Bronze desde clientes S3;
+* lectura posterior desde Apache Spark.
 
-La arquitectura de esta etapa contempla el siguiente recorrido:
-
-```text
-gRPC / REST / NiFi
-        |
-        v
-      Kafka
-        |
-        v
-   Apache Flink
-        |
-        | normalización básica
-        | validaciones técnicas
-        v
-      MinIO
-        |
-        v
-  bucket bnh-bronze
-```
-
-El recorrido validado end-to-end hasta la capa Bronze corresponde actualmente a gRPC.
-
-REST y NiFi ya fueron validados como canales de ingesta hacia Kafka, pero todavía
-no se ejecutó la misma prueba completa hasta MinIO para ambos canales.
-
-La prueba end-to-end realizada para Personas fue:
+La topología actual es:
 
 ```text
-gRPC
-  -> Kafka
-  -> PyFlink
-  -> normalización y validación
-  -> FileSink S3
-  -> MinIO / bnh-bronze/personas/
+REST ──┐
+       │
+gRPC ──┼──> Kafka ──> PyFlink ──> Apache Ozone
+       │                              │
+NiFi ──┘                              └──> bnh-bronze
+                                        ├── personas/
+                                        └── organizaciones/
 ```
 
-### MinIO
+Las tres formas de ingesta ya fueron probadas hasta Bronze para Persona y
+Organización.
 
-Para el laboratorio se utiliza:
+---
+
+### 6.1 Componentes Ozone del laboratorio
+
+El laboratorio utiliza la imagen:
 
 ```text
-minio/minio:RELEASE.2025-09-07T16-13-09Z
+apache/ozone:2.2.1-slim
 ```
 
-MinIO expone:
-
-* API S3: [http://localhost:9000](http://localhost:9000)
-* Consola web: [http://localhost:9001](http://localhost:9001)
-
-El almacenamiento se persiste mediante el volumen Docker:
+Servicios:
 
 ```text
-minio_data
+ozone-scm
+ozone-om
+ozone-datanode
+ozone-s3g
+ozone-init
 ```
 
-El bucket utilizado para la capa Bronze es:
+Conceptualmente:
+
+```text
+                       ┌──────────────┐
+S3 client / Spark ───> │ S3 Gateway   │
+                       └──────┬───────┘
+                              │
+                              v
+                       ┌──────────────┐
+                       │ Ozone Manager│
+                       │     (OM)     │
+                       └──────┬───────┘
+                              │
+                              v
+                       ┌──────────────┐
+                       │     SCM      │
+                       └──────┬───────┘
+                              │
+                              v
+                       ┌──────────────┐
+                       │  DataNode    │
+                       └──────────────┘
+```
+
+Responsabilidades simplificadas:
+
+* **Ozone Manager (OM):** namespace y metadata lógica de volumes, buckets y keys.
+* **Storage Container Manager (SCM):** administración de bloques, pipelines y
+  DataNodes.
+* **DataNode:** almacenamiento físico de los bloques.
+* **S3 Gateway (S3G):** expone una API compatible con S3 para clientes externos.
+* **ozone-init:** inicialización idempotente del volume y bucket Bronze.
+
+---
+
+### 6.2 Configuración mínima del LAB
+
+El laboratorio utiliza un único DataNode y replicación `1`.
+
+Configuraciones relevantes:
+
+```text
+ozone.replication = 1
+hdds.scm.safemode.min.datanode = 1
+```
+
+Esto permite ejecutar Ozone en una PC/laptop con recursos limitados.
+
+> Esta configuración es exclusiva del laboratorio. Una topología productiva
+> debe definir cantidad de nodos, replicación, recursos, seguridad y estrategia
+> de recuperación según los requisitos reales.
+
+---
+
+### 6.3 Persistencia Ozone
+
+Los servicios utilizan volúmenes Docker separados:
+
+```text
+ozone_scm_data
+ozone_om_data
+ozone_datanode_data
+```
+
+Mientras no se ejecute:
+
+```bash
+docker compose down -v
+```
+
+el contenido debería mantenerse entre recreaciones de contenedores.
+
+---
+
+### 6.4 Bronze en Ozone
+
+El bucket S3 utilizado por BNH es:
 
 ```text
 bnh-bronze
 ```
 
-#### Inicialización automática del bucket
-
-El servicio `minio-init` utiliza el cliente oficial de MinIO (`mc`) para crear
-automáticamente el bucket necesario por la capa Bronze.
-
-El inicializador:
-
-1. espera hasta que MinIO acepte conexiones;
-2. configura el alias interno `bnh`;
-3. crea `bnh-bronze` si todavía no existe;
-4. termina con código `0`.
-
-La creación utiliza:
+Dentro de Ozone corresponde actualmente a:
 
 ```text
-mc mb --ignore-existing bnh/bnh-bronze
+/s3v/bnh-bronze
 ```
 
-Por lo tanto, el proceso puede ejecutarse nuevamente sin eliminar ni recrear el
-bucket existente.
+Layout:
 
-Para ejecutar la inicialización manualmente:
+```text
+OBJECT_STORE
+```
+
+Estructura lógica utilizada:
+
+```text
+bnh-bronze/
+├── personas/
+└── organizaciones/
+```
+
+Las aplicaciones acceden mediante rutas:
+
+```text
+s3://bnh-bronze/personas/
+s3://bnh-bronze/organizaciones/
+```
+
+Spark utiliza el esquema:
+
+```text
+s3a://bnh-bronze/...
+```
+
+---
+
+### 6.5 Inicialización automática de Bronze
+
+El servicio:
+
+```text
+ozone-init
+```
+
+evita depender de una creación manual del bucket.
+
+Su responsabilidad es:
+
+1. esperar a que Ozone Manager responda;
+2. crear `/s3v` si no existe;
+3. crear `/s3v/bnh-bronze` si no existe;
+4. utilizar layout `OBJECT_STORE`;
+5. finalizar con exit code `0` si el bucket fue creado o ya existía.
+
+Ejecución manual:
 
 ```bash
-docker compose up minio-init
+docker compose up ozone-init
 ```
 
-Esto evita depender de la creación manual del bucket desde la consola web de
-MinIO y mejora la reproducibilidad del laboratorio.
+La idempotencia fue validada ejecutando el servicio dos veces consecutivas.
+Ambas ejecuciones finalizaron con código `0`.
 
-> La versión y las credenciales utilizadas son exclusivamente para el
-> laboratorio local y no constituyen una definición para ambientes productivos.
+Para verificar directamente el bucket:
 
-### Integración Flink con S3
+```bash
+docker exec bnh-ozone-om \
+  ozone sh bucket info /s3v/bnh-bronze
+```
 
-Flink utiliza el plugin oficial:
+Resultado esperado, entre otros campos:
+
+```text
+volumeName: s3v
+name: bnh-bronze
+bucketLayout: OBJECT_STORE
+```
+
+---
+
+### 6.6 Safe Mode de SCM
+
+Que OM y S3 Gateway respondan no implica necesariamente que Ozone ya pueda
+asignar bloques para escrituras.
+
+Después de un arranque en frío verificar:
+
+```bash
+docker exec bnh-ozone-scm \
+  ozone admin safemode wait -t 60
+```
+
+Esperado:
+
+```text
+SCM is out of safe mode.
+```
+
+Durante la configuración inicial, con un único DataNode, SCM permanecía en Safe
+Mode porque el mínimo de DataNodes no coincidía con la topología del LAB.
+
+Se fijó:
+
+```text
+hdds.scm.safemode.min.datanode = 1
+```
+
+No se utiliza una salida forzada de Safe Mode como solución permanente del
+laboratorio.
+
+---
+
+### 6.7 S3 Gateway
+
+Endpoint interno:
+
+```text
+http://ozone-s3g:9878
+```
+
+Endpoint desde el host:
+
+```text
+http://localhost:9878
+```
+
+Para pruebas S3 del laboratorio se utiliza AWS CLI en un contenedor descartable.
+
+Verificar que el bucket sea visible por S3 Gateway:
+
+```bash
+docker run --rm \
+  --network container:bnh-ozone-s3g \
+  -e AWS_ACCESS_KEY_ID=bnhadmin \
+  -e AWS_SECRET_ACCESS_KEY=bnh-lab-secret \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest \
+  s3api \
+  --endpoint-url http://localhost:9878 \
+  head-bucket \
+  --bucket bnh-bronze
+```
+
+`head-bucket` no imprime contenido cuando finaliza correctamente.
+
+Confirmar exit code:
+
+```bash
+echo $?
+```
+
+Esperado:
+
+```text
+0
+```
+
+---
+
+### 6.8 Listar Bronze por S3
+
+Personas:
+
+```bash
+docker run --rm \
+  --network container:bnh-ozone-s3g \
+  -e AWS_ACCESS_KEY_ID=bnhadmin \
+  -e AWS_SECRET_ACCESS_KEY=bnh-lab-secret \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest \
+  --endpoint-url http://localhost:9878 \
+  s3 ls s3://bnh-bronze/personas/ --recursive
+```
+
+Organizaciones:
+
+```bash
+docker run --rm \
+  --network container:bnh-ozone-s3g \
+  -e AWS_ACCESS_KEY_ID=bnhadmin \
+  -e AWS_SECRET_ACCESS_KEY=bnh-lab-secret \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest \
+  --endpoint-url http://localhost:9878 \
+  s3 ls s3://bnh-bronze/organizaciones/ --recursive
+```
+
+Para inspeccionar un objeto:
+
+```bash
+docker run --rm \
+  --network container:bnh-ozone-s3g \
+  -e AWS_ACCESS_KEY_ID=bnhadmin \
+  -e AWS_SECRET_ACCESS_KEY=bnh-lab-secret \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest \
+  --endpoint-url http://localhost:9878 \
+  s3 cp \
+  s3://bnh-bronze/personas/<RUTA_DEL_OBJETO> -
+```
+
+---
+
+### 6.9 Integración Flink con Ozone
+
+Flink utiliza:
 
 ```text
 flink-s3-fs-hadoop-2.1.1.jar
 ```
 
-El plugin se habilita dentro de:
+habilitado en:
 
 ```text
 /opt/flink/plugins/s3-fs-hadoop/
 ```
 
-La configuración del JobManager y TaskManager apunta al endpoint S3-compatible
-de MinIO:
+Tanto JobManager como TaskManager utilizan el endpoint:
 
 ```text
-s3.endpoint: http://minio:9000
+s3.endpoint: http://ozone-s3g:9878
 s3.path.style.access: true
 ```
 
-Esto permite que PyFlink utilice rutas del tipo:
+Las credenciales configuradas en `compose.yaml` son exclusivamente de LAB.
+
+Los jobs no conocen la implementación física del storage. Continúan escribiendo:
 
 ```text
-s3://bnh-bronze/...
+s3://bnh-bronze/personas/
+s3://bnh-bronze/organizaciones/
 ```
 
-mediante `FileSink`.
+El cambio de backend queda encapsulado principalmente en la configuración S3 de
+Flink.
 
-### Smoke test Flink -> MinIO
+---
 
-Se incorporó el job:
+### 6.10 Smoke test Flink → Ozone
+
+Job:
 
 ```text
 apps/flink/jobs/s3_smoke.py
 ```
 
-Este job genera un registro de prueba mediante PyFlink y lo persiste
-directamente en:
+Destino:
 
 ```text
 s3://bnh-bronze/flink-smoke/
 ```
 
-La prueba fue ejecutada correctamente y el objeto resultante pudo ser listado y
-leído posteriormente desde MinIO.
-
-Con esto se validó técnicamente:
+El objetivo del smoke es probar únicamente:
 
 ```text
 PyFlink
-  -> FileSink
-  -> plugin S3
-  -> MinIO
-  -> bucket Bronze
+  ↓
+FileSink
+  ↓
+plugin S3
+  ↓
+S3 Gateway
+  ↓
+Apache Ozone
 ```
 
-### Procesamiento de Personas
+No valida reglas de Persona u Organización.
 
-El job:
+---
+
+### 6.11 Jobs Bronze vigentes
+
+Persona:
 
 ```text
 apps/flink/jobs/personas_validate.py
 ```
 
-consume eventos desde:
+Topic:
 
 ```text
-topic: bnh.personas
-bootstrap server: kafka:19092
+bnh.personas
 ```
 
-Actualmente realiza una normalización técnica mínima para soportar distintos
-formatos de entrada del laboratorio.
+Destino:
 
-Un evento con envelope:
-
-```json
-{
-  "metadata": {
-    "jurisdiccion": "ARG-B",
-    "dominio": "persona",
-    "lote_id": "L-GRPC-3"
-  },
-  "registro": {
-    "id": "P000001",
-    "nombre": "Persona 1"
-  }
-}
+```text
+s3://bnh-bronze/personas/
 ```
 
-se conserva bajo la estructura común utilizada por el laboratorio.
+Organización:
 
-También se soportan registros planos provenientes de pruebas de ingesta mediante
-NiFi, agregando la metadata mínima necesaria.
+```text
+apps/flink/jobs/organizaciones_validate.py
+```
 
-El resultado actual posee la forma:
+Topic:
+
+```text
+bnh.organizaciones
+```
+
+Destino:
+
+```text
+s3://bnh-bronze/organizaciones/
+```
+
+Ambos jobs centralizan validaciones técnicas y producen:
 
 ```json
 {
   "estado_validacion": "VALIDO",
   "errores": [],
   "metadata": {
-    "jurisdiccion": "ARG-B",
-    "dominio": "persona",
-    "lote_id": "L-GRPC-3"
+    "jurisdiccion": "...",
+    "dominio": "...",
+    "lote_id": "..."
   },
   "registro": {
-    "id": "P000001",
-    "nombre": "Persona 1"
+    "...": "..."
   }
 }
 ```
 
-Las validaciones existentes son deliberadamente simples y corresponden al
-laboratorio. Actualmente permiten verificar, entre otras cosas:
+Los mensajes planos ya no forman parte del contrato vigente. Se requiere el
+envelope:
 
-* JSON válido.
-* presencia de jurisdicción.
-* presencia del identificador del registro.
-* adaptación de distintos formatos de entrada a una estructura común.
+```text
+{metadata, registro}
+```
 
-Estas reglas no constituyen todavía el contrato definitivo de Persona ni las
-reglas de negocio de BNH.
+---
 
-### Checkpointing
+### 6.12 Checkpointing y archivos temporales
 
-El job de streaming habilita checkpointing cada 5 segundos:
+Los jobs habilitan checkpointing cada 5 segundos:
 
 ```python
 env.enable_checkpointing(5000)
 ```
 
-Esto es necesario para que `FileSink` pueda completar y publicar los archivos
-generados durante un flujo continuo.
-
-Además de permitir la persistencia en Bronze, el checkpointing será parte de las
-próximas pruebas relacionadas con recuperación ante fallos y garantías de
-procesamiento.
-
-### Prueba end-to-end
-
-Con el job de Flink en ejecución se enviaron tres registros mediante el cliente
-gRPC:
-
-```bash
-TOTAL_PERSONAS=3 docker compose run --rm grpc-client
-```
-
-Resultado:
+Con `FileSink`, durante una escritura puede aparecer:
 
 ```text
-cantidad_enviada=3
-cantidad_recibida=3
-lote_id=L-GRPC-3
-estado=RECIBIDO
+_part-..._tmp_...
 ```
 
-Luego del checkpoint de Flink se generó un objeto en:
+Eso indica que el archivo todavía no fue finalizado.
+
+Después del rolling/checkpoint correspondiente debe aparecer:
 
 ```text
-bnh-bronze/personas/
+part-...
 ```
 
-El contenido persistido fue:
+Para considerar una prueba Bronze cerrada se verifica el archivo `part-*`
+definitivo, no solamente el `_tmp_`.
+
+---
+
+### 6.13 Validación end-to-end REST → Ozone
+
+Ejemplo validado para Persona:
+
+```text
+lote_id = OZONE-REST-PER-001
+id_persona = OZONE-P000001
+```
+
+Recorrido:
+
+```text
+REST
+ ↓
+Kafka
+ ↓
+Flink
+ ↓
+Ozone Bronze
+```
+
+La API respondió:
 
 ```json
-{"estado_validacion":"VALIDO","errores":[],"metadata":{"jurisdiccion":"ARG-B","dominio":"persona","lote_id":"L-GRPC-3"},"registro":{"id":"P000001","nombre":"Persona 1"}}
-{"estado_validacion":"VALIDO","errores":[],"metadata":{"jurisdiccion":"ARG-B","dominio":"persona","lote_id":"L-GRPC-3"},"registro":{"id":"P000002","nombre":"Persona 2"}}
-{"estado_validacion":"VALIDO","errores":[],"metadata":{"jurisdiccion":"ARG-B","dominio":"persona","lote_id":"L-GRPC-3"},"registro":{"id":"P000003","nombre":"Persona 3"}}
+{
+  "status": "accepted",
+  "lote_id": "OZONE-REST-PER-001",
+  "cantidad_registros": 1
+}
 ```
 
-De esta forma quedó validado el recorrido:
+Flink produjo:
 
 ```text
-gRPC -> Kafka -> Flink -> Bronze
+estado_validacion = VALIDO
 ```
 
-### Estado actual
+y después del checkpoint quedó un archivo final:
 
-Validado en el laboratorio:
+```text
+bnh-bronze/personas/<fecha-hora>/part-...
+```
 
-* Kafka como bus de eventos.
-* gRPC como canal de ingesta.
-* NiFi como canal de ingesta desde archivos.
-* PyFlink consumiendo Kafka.
-* normalización y validación técnica básica.
-* checkpointing de Flink.
-* MinIO como almacenamiento S3-compatible.
-* escritura desde Flink hacia Bronze.
-* lectura posterior de los objetos persistidos.
+Para buscar un lote de Persona directamente en Bronze:
 
-### Alcance actual
+```bash
+docker run --rm \
+  --network container:bnh-ozone-s3g \
+  -e AWS_ACCESS_KEY_ID=bnhadmin \
+  -e AWS_SECRET_ACCESS_KEY=bnh-lab-secret \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  --entrypoint /bin/sh \
+  amazon/aws-cli:latest -c '
+    aws --endpoint-url http://localhost:9878 \
+      s3 cp s3://bnh-bronze/personas/ /tmp/personas/ --recursive >/dev/null &&
+    grep -R "OZONE-REST-PER-001" /tmp/personas | grep -v "/_part-"
+  '
+```
 
-El trabajo se encuentra limitado a la capa Bronze.
+La misma prueba fue realizada para Organización:
 
-Por el momento quedan fuera de esta etapa:
+```text
+lote_id = OZONE-REST-ORG-001
+id_organizacion = OZONE-ORG-0001
+```
 
-* persistencia en PostgreSQL.
-* procesamiento analítico con Spark.
-* orquestación con Airflow.
-* reglas educativas complejas.
-* calificaciones.
-* modelo definitivo de datos.
+con archivo final:
 
-Estas etapas se retomarán cuando exista mayor definición de los contratos y de
-los datos reales proporcionados por las jurisdicciones.
+```text
+bnh-bronze/organizaciones/<fecha-hora>/part-...
+```
 
-### Próximas investigaciones
+---
 
-La siguiente etapa del laboratorio estará orientada a estudiar qué capacidades
-de Flink resultan útiles dentro de la capa Bronze, priorizando controles
-técnicos sobre reglas educativas todavía no definidas.
+### 6.14 Validación Ozone → Spark
 
-Entre los casos a evaluar se encuentran:
+Antes de construir Processed se validó que Spark pudiera leer un objeto Bronze
+real mediante S3A.
 
-* cálculo de checksum.
-* validaciones por campo.
-* validaciones por lote.
-* detección de duplicados.
-* separación de registros válidos e inválidos.
-* preservación del evento original.
-* state y ventanas.
-* comportamiento ante fallos.
-* recuperación mediante checkpoints.
-* garantías de entrega y procesamiento.
+Recorrido:
 
-La definición final de estas reglas dependerá de los contratos y ejemplos de
-datos que proporcione el cliente.
+```text
+Apache Ozone
+    ↓
+S3 Gateway
+    ↓
+S3A
+    ↓
+Apache Spark
+```
 
+La lectura de prueba devolvió:
+
+```text
+TOTAL OZONE = 2
+```
+
+y Spark reconstruyó correctamente las estructuras:
+
+```text
+errores
+estado_validacion
+metadata
+registro
+```
+
+Esto confirmó que el almacenamiento Bronze generado por Flink puede ser
+consumido directamente por Spark.
+
+---
+
+### 6.15 Estado de la etapa Bronze
+
+Validado:
+
+```text
+REST ──┐
+       │
+gRPC ──┼──> Kafka ──> Flink ──> Ozone Bronze
+       │
+NiFi ──┘
+```
+
+Para Persona:
+
+```text
+REST → Bronze  ✅
+gRPC → Bronze  ✅
+NiFi → Bronze  ✅
+```
+
+Para Organización:
+
+```text
+REST → Bronze  ✅
+gRPC → Bronze  ✅
+NiFi → Bronze  ✅
+```
+
+También validado:
+
+* inicialización idempotente del bucket;
+* Safe Mode compatible con la topología mínima del LAB;
+* S3 Gateway;
+* escritura de objetos;
+* checkpointing de Flink;
+* finalización `_tmp_` → `part-*`;
+* lectura S3;
+* lectura Ozone → Spark.
+
+La etapa siguiente transforma Bronze hacia el schema `processed` del Data
+Warehouse.
+
+---
+---
 
 ## Validación e integración de Persona hasta Bronze
 
@@ -3175,7 +3623,7 @@ REST ──┐
 gRPC ──┼──> Kafka (`bnh.personas`) ──> PyFlink ──> Bronze (S3 compatible)
        │
 NiFi ──┘
-````
+```
 
 Estado actual:
 
@@ -3401,13 +3849,31 @@ Ejecutar desde la raíz del repositorio.
 
 ### Infraestructura mínima
 
+Para una sesión normal puede levantarse todo el laboratorio:
+
+```bash
+docker compose up -d
+```
+
+Si se desea levantar únicamente el tramo necesario hasta Bronze:
+
 ```bash
 docker compose up -d \
   kafka \
-  minio \
-  minio-init \
+  ozone-scm \
+  ozone-om \
+  ozone-datanode \
+  ozone-s3g \
+  ozone-init \
   flink-jobmanager \
   flink-taskmanager
+```
+
+Antes de enviar datos, esperar que SCM pueda asignar bloques:
+
+```bash
+docker exec bnh-ozone-scm \
+  ozone admin safemode wait -t 60
 ```
 
 ### Crear el topic Kafka
@@ -3583,28 +4049,42 @@ docker logs --tail 1000 bnh-flink-taskmanager 2>&1 \
 
 ## Verificar Bronze
 
-Listar objetos:
+Listar objetos de Persona mediante S3 Gateway:
 
 ```bash
-docker compose run --rm \
-  --entrypoint /bin/sh \
-  minio-init \
-  -c '
-    mc alias set bnh http://minio:9000 bnhadmin BnhMinioLaboratory1234 >/dev/null &&
-    mc ls --recursive bnh/bnh-bronze/personas
-  '
+docker run --rm \
+  --network container:bnh-ozone-s3g \
+  -e AWS_ACCESS_KEY_ID=bnhadmin \
+  -e AWS_SECRET_ACCESS_KEY=bnh-lab-secret \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest \
+  --endpoint-url http://localhost:9878 \
+  s3 ls s3://bnh-bronze/personas/ --recursive
 ```
 
 Para inspeccionar un objeto:
 
 ```bash
-docker compose run --rm \
-  --entrypoint /bin/sh \
-  minio-init \
-  -c '
-    mc alias set bnh http://minio:9000 bnhadmin BnhMinioLaboratory1234 >/dev/null &&
-    mc cat bnh/bnh-bronze/personas/<RUTA_DEL_ARCHIVO>
-  '
+docker run --rm \
+  --network container:bnh-ozone-s3g \
+  -e AWS_ACCESS_KEY_ID=bnhadmin \
+  -e AWS_SECRET_ACCESS_KEY=bnh-lab-secret \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest \
+  --endpoint-url http://localhost:9878 \
+  s3 cp s3://bnh-bronze/personas/<RUTA_DEL_OBJETO> -
+```
+
+Para considerar la escritura finalizada, usar archivos:
+
+```text
+part-...
+```
+
+y no los temporales:
+
+```text
+_part-..._tmp_...
 ```
 
 ---
@@ -4137,13 +4617,31 @@ Persona puede seguir corriendo en paralelo. No es necesario detenerla.
 
 ### Infraestructura mínima
 
+Para una sesión normal puede levantarse todo el laboratorio:
+
+```bash
+docker compose up -d
+```
+
+Si se desea levantar únicamente el tramo necesario hasta Bronze:
+
 ```bash
 docker compose up -d \
   kafka \
-  minio \
-  minio-init \
+  ozone-scm \
+  ozone-om \
+  ozone-datanode \
+  ozone-s3g \
+  ozone-init \
   flink-jobmanager \
   flink-taskmanager
+```
+
+Antes de enviar datos, esperar que SCM pueda asignar bloques:
+
+```bash
+docker exec bnh-ozone-scm \
+  ozone admin safemode wait -t 60
 ```
 
 ### Crear el topic Kafka
@@ -4311,13 +4809,27 @@ docker logs --tail 1000 bnh-flink-taskmanager 2>&1 \
 ## Verificar Bronze
 
 ```bash
-docker compose run --rm \
-  --entrypoint /bin/sh \
-  minio-init \
-  -c '
-    mc alias set bnh http://minio:9000 bnhadmin BnhMinioLaboratory1234 >/dev/null &&
-    mc ls --recursive bnh/bnh-bronze/organizaciones
-  '
+docker run --rm \
+  --network container:bnh-ozone-s3g \
+  -e AWS_ACCESS_KEY_ID=bnhadmin \
+  -e AWS_SECRET_ACCESS_KEY=bnh-lab-secret \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest \
+  --endpoint-url http://localhost:9878 \
+  s3 ls s3://bnh-bronze/organizaciones/ --recursive
+```
+
+Para inspeccionar un objeto:
+
+```bash
+docker run --rm \
+  --network container:bnh-ozone-s3g \
+  -e AWS_ACCESS_KEY_ID=bnhadmin \
+  -e AWS_SECRET_ACCESS_KEY=bnh-lab-secret \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest \
+  --endpoint-url http://localhost:9878 \
+  s3 cp s3://bnh-bronze/organizaciones/<RUTA_DEL_OBJETO> -
 ```
 
 ---
@@ -4563,4 +5075,916 @@ Todavía no se implementan:
 
 Esos puntos quedan pendientes de definición o de acceso con el cliente.
 No se documentan como confirmados.
+
+
+
+---
+---
+
+## Etapa 7 — Apache Spark + PostgreSQL DW / Processed
+
+Esta etapa extiende el laboratorio después de Bronze.
+
+El objetivo es validar:
+
+```text
+Apache Ozone / Bronze
+        ↓
+Apache Spark
+        ↓
+transformación batch
+        ↓
+PostgreSQL Data Warehouse
+        ↓
+schema processed
+```
+
+En esta etapa no se construye `Curated` ni Data Marts.
+
+La razón es deliberada: todavía no existen suficientes reglas de negocio
+confirmadas para deduplicar, integrar o reinterpretar los registros desde una
+perspectiva funcional.
+
+`Processed` realiza transformaciones técnicas y relacionales sin inventar
+semántica de negocio.
+
+---
+
+### 7.1 Arquitectura de la etapa
+
+```text
+REST / gRPC / NiFi
+        ↓
+      Kafka
+        ↓
+      Flink
+        ↓
+Apache Ozone / Bronze
+        ↓
+      Spark
+        ↓
+ PostgreSQL DW
+        ↓
+    processed
+    ├── persona
+    └── organizacion
+```
+
+Apache Spark procesa los datos.
+
+PostgreSQL almacena el resultado estructurado.
+
+Airflow todavía no interviene; actualmente los jobs Spark se ejecutan
+manualmente mediante `spark-submit`.
+
+---
+
+### 7.2 PostgreSQL Data Warehouse
+
+Servicio:
+
+```text
+postgres-dw
+```
+
+Imagen:
+
+```text
+postgres:17
+```
+
+Base:
+
+```text
+bnh_dw
+```
+
+Usuario LAB:
+
+```text
+bnh
+```
+
+Puerto:
+
+```text
+Host:      localhost:5433
+Docker:    postgres-dw:5432
+```
+
+El DW es independiente de cualquier futura base de metadata de Airflow.
+
+---
+
+### 7.3 Inicialización del DW
+
+Archivos versionados:
+
+```text
+docker/postgres-dw/init/
+├── 001_create_processed.sql
+├── 002_create_processed_persona.sql
+└── 003_create_processed_organizacion.sql
+```
+
+`001_create_processed.sql` crea:
+
+```sql
+CREATE SCHEMA IF NOT EXISTS processed;
+```
+
+Los scripts ubicados en:
+
+```text
+/docker-entrypoint-initdb.d
+```
+
+se ejecutan automáticamente solamente cuando PostgreSQL inicializa un volumen
+vacío.
+
+Por lo tanto:
+
+* **volumen nuevo:** los scripts se ejecutan automáticamente;
+* **volumen existente:** agregar un nuevo archivo SQL no modifica la base ya
+  inicializada.
+
+Para aplicar manualmente un script sobre un volumen existente:
+
+```bash
+docker exec -i bnh-postgres-dw \
+  psql -U bnh -d bnh_dw \
+  < docker/postgres-dw/init/<ARCHIVO>.sql
+```
+
+---
+
+### 7.4 Tabla `processed.persona`
+
+Definición versionada en:
+
+```text
+docker/postgres-dw/init/002_create_processed_persona.sql
+```
+
+Estructura:
+
+```sql
+CREATE TABLE IF NOT EXISTS processed.persona (
+    id_persona                  TEXT NOT NULL,
+    jurisdiccion                TEXT,
+    lote_id                     TEXT,
+    fecha_nacimiento            DATE,
+    cuit                        TEXT,
+    c_documento                 TEXT,
+    nro_documento               TEXT,
+    c_pais_nacimiento           TEXT,
+    c_provincia_nacimiento      TEXT,
+    c_departamento_nacimiento   TEXT,
+    c_localidad_nacimiento      TEXT,
+    c_municipio_nacimiento      TEXT,
+    lugar_nacimiento            TEXT,
+    c_fallecido                 TEXT,
+    fecha_fallecido             DATE,
+    c_es_indigena               TEXT,
+    processed_at                TIMESTAMP NOT NULL
+);
+```
+
+---
+
+### 7.5 Tabla `processed.organizacion`
+
+Definición versionada en:
+
+```text
+docker/postgres-dw/init/003_create_processed_organizacion.sql
+```
+
+Estructura:
+
+```sql
+CREATE TABLE IF NOT EXISTS processed.organizacion (
+    id_organizacion TEXT NOT NULL,
+    jurisdiccion    TEXT,
+    lote_id         TEXT,
+    nombre          TEXT NOT NULL,
+    descripcion     TEXT,
+    c_organizacion  TEXT NOT NULL,
+    fecha_alta      DATE NOT NULL,
+    fecha_baja      DATE,
+    processed_at    TIMESTAMP NOT NULL
+);
+```
+
+---
+
+### 7.6 Apache Spark
+
+El laboratorio utiliza:
+
+```text
+spark:4.1.2-python3
+```
+
+Topología:
+
+```text
+spark-master
+    │
+    └── spark-worker
+```
+
+Master:
+
+```text
+spark://spark-master:7077
+```
+
+UI:
+
+```text
+http://localhost:8082
+```
+
+El worker del LAB está limitado a:
+
+```text
+2 cores
+2 GB RAM
+```
+
+El objetivo es mantener una topología distribuida mínima que también pueda
+ejecutarse en una laptop de trabajo.
+
+Los jobs versionados se montan en el master:
+
+```text
+./apps/spark/jobs:/opt/spark/jobs:ro
+```
+
+---
+
+### 7.7 Validar ejecución distribuida de Spark
+
+Smoke de cálculo:
+
+```bash
+docker exec bnh-spark-master \
+  /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  /opt/spark/examples/src/main/python/pi.py \
+  10
+```
+
+Durante la prueba el master asignó un executor al worker y el job finalizó
+correctamente.
+
+El objetivo de esta prueba no es calcular Pi como funcionalidad del proyecto,
+sino demostrar:
+
+```text
+spark-submit
+    ↓
+Spark Master
+    ↓
+Spark Worker
+    ↓
+ejecución distribuida
+```
+
+---
+
+### 7.8 Dependencias para S3A
+
+Spark debe leer Bronze mediante:
+
+```text
+s3a://
+```
+
+La imagen base utilizada no incluye `hadoop-aws`.
+
+Spark 4.1.2 incluye Hadoop 3.4.2, por lo que en el laboratorio se utiliza:
+
+```text
+org.apache.hadoop:hadoop-aws:3.4.2
+```
+
+También se fija un directorio Ivy escribible:
+
+```text
+spark.jars.ivy=/tmp/ivy
+```
+
+porque el usuario de la imagen Spark no dispone de un home convencional
+escribible para el cache default.
+
+Actualmente las dependencias se resuelven dinámicamente con `--packages`.
+
+> Esto es aceptable para el laboratorio. Para una imagen productiva/reproducible
+> sin dependencia de Maven durante el arranque se deberá evaluar incorporarlas a
+> una imagen propia.
+
+---
+
+### 7.9 Configuración Spark → Ozone
+
+Parámetros utilizados:
+
+```text
+spark.hadoop.fs.s3a.endpoint=http://ozone-s3g:9878
+spark.hadoop.fs.s3a.endpoint.region=us-east-1
+spark.hadoop.fs.s3a.path.style.access=true
+spark.hadoop.fs.s3a.connection.ssl.enabled=false
+spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+```
+
+Las credenciales son únicamente de laboratorio.
+
+Flujo validado:
+
+```text
+Ozone
+  ↓
+S3 Gateway
+  ↓
+S3A
+  ↓
+Spark
+```
+
+---
+
+### 7.10 Driver PostgreSQL JDBC
+
+Para escribir el DW se utiliza:
+
+```text
+org.postgresql:postgresql:42.7.13
+```
+
+URL JDBC interna:
+
+```text
+jdbc:postgresql://postgres-dw:5432/bnh_dw
+```
+
+Los jobs actuales contienen configuración LAB explícita.
+
+> En producción las credenciales deberán externalizarse y gestionarse mediante
+> secretos. No deben quedar embebidas en jobs.
+
+---
+
+## Job Spark Persona
+
+Archivo:
+
+```text
+apps/spark/jobs/personas_processed.py
+```
+
+Origen:
+
+```text
+s3a://bnh-bronze/personas/*/part-*
+```
+
+Destino:
+
+```text
+processed.persona
+```
+
+### 7.11 Selección de candidatos
+
+Un registro es candidato cuando:
+
+```text
+estado_validacion = VALIDO
+metadata.dominio = persona
+registro.id_persona != null
+```
+
+Esto evita promover directamente registros `INVALIDO` hacia Processed.
+
+---
+
+### 7.12 Tipado defensivo
+
+Spark convierte:
+
+```text
+registro.fecha_nacimiento → DATE
+registro.fecha_fallecido  → DATE
+```
+
+utilizando:
+
+```sql
+try_cast(... AS DATE)
+```
+
+Un registro se considera técnicamente apto cuando:
+
+* `fecha_nacimiento` puede convertirse a `DATE`;
+* si `fecha_fallecido` viene informada, también puede convertirse a `DATE`.
+
+Si no se puede tipar, el registro permanece preservado en Bronze pero no se
+promociona al DW.
+
+Esto no significa que Spark reimplemente todas las reglas de Flink.
+
+Es una barrera técnica para garantizar que el modelo relacional pueda almacenar
+el registro.
+
+Durante una prueba con datos Bronze históricos se detectaron:
+
+```text
+Candidatos: 40
+Descartados por tipado: 2
+Processed: 38
+```
+
+Los dos descartados contenían:
+
+```text
+fecha_fallecido = 2025-99-99
+```
+
+aunque estaban marcados como `VALIDO` por una versión anterior del flujo.
+
+Este caso justificó mantener el tipado defensivo en la capa Processed.
+
+---
+
+### 7.13 Transformación Persona
+
+Spark aplana:
+
+```text
+metadata.jurisdiccion → jurisdiccion
+metadata.lote_id      → lote_id
+registro.*            → columnas relacionales
+```
+
+y agrega:
+
+```text
+processed_at
+```
+
+Ejemplo conceptual:
+
+```text
+Bronze
+
+{
+  "metadata": {
+    "jurisdiccion": "ARG-B",
+    "lote_id": "LOTE-001"
+  },
+  "registro": {
+    "id_persona": "P000001",
+    "fecha_nacimiento": "1990-05-10"
+  }
+}
+
+             ↓ Spark
+
+Processed
+
+id_persona | jurisdiccion | lote_id  | fecha_nacimiento
+P000001    | ARG-B        | LOTE-001 | 1990-05-10
+```
+
+---
+
+### 7.14 Ejecutar Persona Bronze → Processed
+
+```bash
+docker exec bnh-spark-master \
+  /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --conf spark.jars.ivy=/tmp/ivy \
+  --packages org.apache.hadoop:hadoop-aws:3.4.2,org.postgresql:postgresql:42.7.13 \
+  --conf spark.hadoop.fs.s3a.endpoint=http://ozone-s3g:9878 \
+  --conf spark.hadoop.fs.s3a.endpoint.region=us-east-1 \
+  --conf spark.hadoop.fs.s3a.access.key=bnhadmin \
+  --conf spark.hadoop.fs.s3a.secret.key=bnh-lab-secret \
+  --conf spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider \
+  --conf spark.hadoop.fs.s3a.path.style.access=true \
+  --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
+  /opt/spark/jobs/personas_processed.py
+```
+
+Buscar en la salida:
+
+```text
+Candidatos: ...
+Descartados por tipado: ...
+Processed: ...
+Carga PostgreSQL completada
+```
+
+No debería finalizar con `Traceback`.
+
+En la validación actual sobre Ozone se obtuvo:
+
+```text
+Candidatos: 3
+Descartados por tipado: 0
+Processed: 3
+Carga PostgreSQL completada
+```
+
+---
+
+### 7.15 Verificar Persona en PostgreSQL
+
+```bash
+docker exec bnh-postgres-dw \
+  psql -U bnh -d bnh_dw \
+  -c "SELECT id_persona, jurisdiccion, lote_id, fecha_nacimiento, processed_at FROM processed.persona ORDER BY id_persona;"
+```
+
+Validación observada:
+
+```text
+OZONE-P000001 | ARG-B | OZONE-REST-PER-001
+P000001       | ARG-B | REST-PERSONA-SMOKE-ORG
+P000001       | ARG-B | GRPC-PERSONA-SMOKE-ORG
+```
+
+La repetición de `id_persona` no se elimina en Processed.
+
+Cada fila puede corresponder a diferentes lotes/eventos Bronze.
+
+No existe todavía una regla funcional confirmada para elegir una única versión.
+
+---
+
+## Job Spark Organización
+
+Archivo:
+
+```text
+apps/spark/jobs/organizaciones_processed.py
+```
+
+Origen:
+
+```text
+s3a://bnh-bronze/organizaciones/*/part-*
+```
+
+Destino:
+
+```text
+processed.organizacion
+```
+
+---
+
+### 7.16 Selección y tipado de Organización
+
+Candidatos:
+
+```text
+estado_validacion = VALIDO
+metadata.dominio = organizacion
+registro.id_organizacion != null
+```
+
+Se convierten:
+
+```text
+fecha_alta → DATE
+fecha_baja → DATE
+```
+
+`fecha_alta` debe ser tipable.
+
+Si `fecha_baja` está informada, también debe ser tipable.
+
+---
+
+### 7.17 Ejecutar Organización Bronze → Processed
+
+```bash
+docker exec bnh-spark-master \
+  /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --conf spark.jars.ivy=/tmp/ivy \
+  --packages org.apache.hadoop:hadoop-aws:3.4.2,org.postgresql:postgresql:42.7.13 \
+  --conf spark.hadoop.fs.s3a.endpoint=http://ozone-s3g:9878 \
+  --conf spark.hadoop.fs.s3a.endpoint.region=us-east-1 \
+  --conf spark.hadoop.fs.s3a.access.key=bnhadmin \
+  --conf spark.hadoop.fs.s3a.secret.key=bnh-lab-secret \
+  --conf spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider \
+  --conf spark.hadoop.fs.s3a.path.style.access=true \
+  --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
+  /opt/spark/jobs/organizaciones_processed.py
+```
+
+Validación actual:
+
+```text
+Candidatos: 1
+Descartados por tipado: 0
+Processed: 1
+Carga PostgreSQL completada
+```
+
+---
+
+### 7.18 Verificar Organización en PostgreSQL
+
+```bash
+docker exec bnh-postgres-dw \
+  psql -U bnh -d bnh_dw \
+  -c "SELECT id_organizacion, jurisdiccion, lote_id, nombre, c_organizacion, fecha_alta, fecha_baja, processed_at FROM processed.organizacion;"
+```
+
+Fila validada:
+
+```text
+OZONE-ORG-0001
+ARG-B
+OZONE-REST-ORG-001
+Organizacion Ozone Test
+01
+2020-01-15
+```
+
+---
+
+### 7.19 Estrategia de escritura actual
+
+Los jobs utilizan:
+
+```text
+mode("overwrite")
+truncate = true
+```
+
+El objetivo del LAB es que una reejecución reconstruya la tabla Processed desde
+el Bronze disponible y no duplique filas simplemente por volver a ejecutar el
+mismo job.
+
+Conceptualmente:
+
+```text
+Bronze actual
+    ↓
+Spark
+    ↓
+reconstrucción técnica
+    ↓
+Processed actual
+```
+
+Esta estrategia es simple y determinista para el laboratorio.
+
+No es todavía una estrategia incremental de producción.
+
+Pendiente para una plataforma operacional:
+
+* identificar nuevos objetos/lotes;
+* controlar reejecuciones parciales;
+* definir idempotencia;
+* definir upsert/merge;
+* versionado de contratos;
+* tratamiento de correcciones;
+* recuperación ante fallas de carga.
+
+---
+
+### 7.20 Qué NO hace Processed
+
+Actualmente no:
+
+* deduplica Personas u Organizaciones;
+* decide cuál registro prevalece;
+* cruza catálogos oficiales;
+* resuelve relaciones organizacionales;
+* integra fuentes externas;
+* aplica reglas educativas;
+* construye `Curated`;
+* construye Data Marts.
+
+Esas capacidades requieren reglas funcionales y criterios de negocio
+confirmados.
+
+---
+
+### 7.21 Validación completa del flujo actual
+
+Persona:
+
+```text
+REST/gRPC/NiFi
+      ↓
+Kafka
+      ↓
+Flink
+      ↓
+Ozone Bronze
+      ↓
+Spark
+      ↓
+processed.persona
+      ↓
+PostgreSQL
+      ✅
+```
+
+Organización:
+
+```text
+REST/gRPC/NiFi
+      ↓
+Kafka
+      ↓
+Flink
+      ↓
+Ozone Bronze
+      ↓
+Spark
+      ↓
+processed.organizacion
+      ↓
+PostgreSQL
+      ✅
+```
+
+---
+
+### 7.22 Inspección con DBeaver
+
+Conexión al DW desde el host:
+
+```text
+Host: localhost
+Port: 5433
+Database: bnh_dw
+User: bnh
+```
+
+El password es el configurado para el laboratorio en `compose.yaml`.
+
+Una vez conectado debería verse:
+
+```text
+bnh_dw
+└── Schemas
+    └── processed
+        ├── persona
+        └── organizacion
+```
+
+DBeaver es únicamente una herramienta de inspección/consulta. No forma parte del
+pipeline de procesamiento.
+
+---
+
+### 7.23 Troubleshooting Spark
+
+#### `UNABLE_TO_INFER_SCHEMA`
+
+Síntoma:
+
+```text
+Unable to infer schema for JSON
+```
+
+Bronze organiza archivos dentro de directorios fecha/hora.
+
+Usar:
+
+```text
+s3a://bnh-bronze/personas/*/part-*
+```
+
+en lugar de apuntar solamente al directorio raíz.
+
+---
+
+#### `CANNOT_PARSE_TIMESTAMP`
+
+Síntoma:
+
+```text
+Text '2025-99-99' could not be parsed
+```
+
+No utilizar conversiones estrictas directamente sobre datos históricos.
+
+Los jobs actuales usan:
+
+```text
+try_cast(... AS DATE)
+```
+
+y filtran los registros no tipables antes de escribir Processed.
+
+---
+
+#### Error de Ivy en directorio `/nonexistent`
+
+Síntoma:
+
+```text
+FileNotFoundException
+/nonexistent/.ivy...
+```
+
+Usar:
+
+```text
+--conf spark.jars.ivy=/tmp/ivy
+```
+
+---
+
+#### Spark no encuentra `hadoop-aws`
+
+Agregar:
+
+```text
+--packages org.apache.hadoop:hadoop-aws:3.4.2
+```
+
+---
+
+#### Spark no encuentra el driver PostgreSQL
+
+Agregar:
+
+```text
+--packages org.postgresql:postgresql:42.7.13
+```
+
+junto con `hadoop-aws`.
+
+---
+
+#### Spark está detenido
+
+Levantar:
+
+```bash
+docker compose up -d spark-master spark-worker
+```
+
+---
+
+#### PostgreSQL está detenido
+
+Levantar:
+
+```bash
+docker compose up -d postgres-dw
+```
+
+---
+
+### 7.24 Estado del laboratorio al cierre de esta etapa
+
+Confirmado:
+
+* Kafka 4.3.0 operativo.
+* REST, gRPC y NiFi como canales de ingesta.
+* Persona y Organización convergen en Kafka/Bronze.
+* Flink 2.1.1 normaliza y valida.
+* Apache Ozone 2.2.1 es el storage Bronze activo.
+* S3 Gateway validado.
+* Bronze Persona y Organización validado.
+* Spark 4.1.2 master/worker validado.
+* Spark lee Ozone mediante S3A.
+* `processed.persona` validado.
+* `processed.organizacion` validado.
+* PostgreSQL 17 funciona como DW del laboratorio.
+* reconstrucción de tablas Processed mediante Spark validada.
+
+Pendiente inmediato:
+
+```text
+Apache Airflow
+```
+
+Objetivo de la siguiente etapa:
+
+```text
+Airflow
+   ↓
+orquestar jobs Spark
+   ↓
+Ozone Bronze → Processed
+```
+
+Airflow deberá utilizar una base PostgreSQL de metadata separada del Data
+Warehouse.
+
+---
 
