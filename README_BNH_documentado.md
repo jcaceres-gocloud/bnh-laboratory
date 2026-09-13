@@ -1,0 +1,5990 @@
+# bnh-laboratory
+Laboratory from bnh infrastructure
+
+> **Lectura recomendada:** las Etapas 1 a 5 muestran la evolución incremental del
+> laboratorio. Las secciones de validación de Persona/Organización y las Etapas 6
+> y 7 describen el flujo técnico vigente.
+>
+> El laboratorio actual llega hasta `Processed`. `Curated`, Data Marts y Airflow
+> todavía no forman parte del flujo validado.
+
+## Estado actual del laboratorio
+
+Arquitectura técnica validada:
+
+```text
+REST ──┐
+       │
+gRPC ──┼──> Kafka ──> PyFlink ──> Apache Ozone / Bronze ──> Apache Spark ──> PostgreSQL DW
+       │                                                   │
+NiFi ──┘                                                   └──> schema processed
+```
+
+Entidades cerradas hasta `Processed`:
+
+```text
+Persona        ✅
+Organización   ✅
+```
+
+Responsabilidad principal de cada componente:
+
+| Componente | Responsabilidad en el laboratorio |
+|---|---|
+| REST / gRPC / NiFi | Canales de ingreso |
+| Kafka | Transporte y desacoplamiento |
+| PyFlink | Parsing, normalización, canonicalización y validaciones técnicas |
+| Apache Ozone | Persistencia Bronze mediante interfaz S3 |
+| Apache Spark | Transformación batch de Bronze a Processed |
+| PostgreSQL DW | Persistencia relacional de Processed |
+| DBeaver | Inspección manual del DW |
+| Prometheus / Grafana | Base de observabilidad del laboratorio |
+| Airflow | Pendiente: orquestación de jobs Spark |
+
+### Servicios y puertos principales
+
+| Servicio | Uso | Puerto host |
+|---|---|---:|
+| Kafka | Broker | `9092` |
+| API REST | Ingesta HTTP | `8000` |
+| gRPC server | Ingesta gRPC | `50051` |
+| NiFi | UI / ingesta de archivos | `8443` |
+| Flink JobManager | UI | `8081` |
+| Ozone OM | UI/API administrativa | `9874` |
+| Ozone SCM | UI/API administrativa | `9876` |
+| Ozone S3 Gateway | API compatible S3 | `9878` |
+| Spark Master | Cluster | `7077` |
+| Spark Master UI | UI | `8082` |
+| PostgreSQL DW | DW | `5433` |
+
+Los nombres y recursos corresponden al laboratorio local. No constituyen una
+topología productiva.
+
+## Arranque estándar del laboratorio
+
+El laboratorio se detiene antes de apagar el equipo. Por lo tanto, al iniciar
+una nueva sesión se debe asumir que los contenedores están detenidos.
+
+### 1. Levantar el stack
+
+```bash
+docker compose up -d
+```
+
+### 2. Verificar servicios
+
+```bash
+docker compose ps
+```
+
+Los servicios persistentes principales deberían quedar en estado `Up`.
+Algunos servicios de inicialización o clientes de prueba pueden finalizar con
+código `0` porque son procesos one-shot.
+
+### 3. Esperar que Ozone pueda aceptar escrituras
+
+```bash
+docker exec bnh-ozone-scm \
+  ozone admin safemode wait -t 60
+```
+
+Resultado esperado:
+
+```text
+SCM is out of safe mode.
+```
+
+Si SCM permanece en Safe Mode, no continuar con pruebas de escritura hasta
+resolverlo.
+
+### 4. Verificar los jobs Flink
+
+Los contenedores Flink pueden estar `Up` sin que los jobs de Persona y
+Organización estén ejecutándose.
+
+```bash
+curl -s http://localhost:8081/jobs/overview
+```
+
+Si faltan, enviarlos nuevamente:
+
+```bash
+docker exec bnh-flink-jobmanager \
+  flink run -d \
+  -py /opt/flink/jobs/personas_validate.py
+```
+
+```bash
+docker exec bnh-flink-jobmanager \
+  flink run -d \
+  -py /opt/flink/jobs/organizaciones_validate.py
+```
+
+### 5. Detener sin borrar datos
+
+```bash
+docker compose down
+```
+
+Esto elimina contenedores y red, pero conserva los volúmenes.
+
+### Reinicio destructivo
+
+```bash
+docker compose down -v
+```
+
+> Usar `-v` únicamente cuando se quiera eliminar deliberadamente el estado
+> persistido de Kafka, NiFi, Ozone, PostgreSQL y demás servicios con volumen.
+
+---
+
+
+## Etapa 1 — Apache Kafka
+
+El objetivo de esta etapa es validar un Kafka local con Docker Compose y comprobar:
+
+* que el broker levanta correctamente;
+* que podemos conectarnos desde un cliente;
+* crear un topic;
+* crear varias particiones;
+* producir eventos con `key`;
+* consumirlos;
+* observar cómo Kafka distribuye los eventos entre particiones.
+
+### Requisitos
+
+Tener instalados:
+
+```bash
+docker --version
+docker compose version
+```
+
+Este laboratorio fue probado inicialmente en:
+
+* Debian 13
+* Ubuntu 24.04
+
+---
+
+## 1. Configuración de Kafka
+
+El archivo `compose.yaml` contiene un único broker Kafka ejecutando también como controller mediante KRaft.
+
+```yaml
+services:
+  kafka:
+    image: apache/kafka:4.3.0
+    container_name: bnh-kafka
+    hostname: kafka
+
+    ports:
+      - "9092:9092"
+
+    environment:
+      KAFKA_NODE_ID: 1
+
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: >
+        CONTROLLER:PLAINTEXT,
+        INTERNAL:PLAINTEXT,
+        EXTERNAL:PLAINTEXT
+
+      KAFKA_LISTENERS: >
+        CONTROLLER://:29093,
+        INTERNAL://:19092,
+        EXTERNAL://:9092
+
+      KAFKA_ADVERTISED_LISTENERS: >
+        INTERNAL://kafka:19092,
+        EXTERNAL://localhost:9092
+
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      KAFKA_CONTROLLER_QUORUM_VOTERS: >
+        1@kafka:29093
+
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+volumes:
+  kafka_data:
+```
+
+Los listeners quedan preparados para:
+
+```text
+Host local             → localhost:9092
+Futuros contenedores   → kafka:19092
+```
+
+---
+
+## 2. Validar el Compose
+
+### Para qué
+
+Verificar que Docker Compose puede interpretar correctamente el archivo antes de levantar los servicios.
+
+### Comando
+
+```bash
+docker compose config
+```
+
+### Resultado esperado
+
+Debe mostrar la configuración expandida sin errores.
+
+Entre otras cosas deberían aparecer:
+
+```text
+container_name: bnh-kafka
+image: apache/kafka:4.3.0
+published: "9092"
+```
+
+---
+
+## 3. Levantar Kafka
+
+### Para qué
+
+Crear la red, el volumen persistente y arrancar el broker Kafka.
+
+### Comando
+
+```bash
+docker compose up -d kafka
+```
+
+### Resultado esperado
+
+Algo similar a:
+
+```text
+Image apache/kafka:4.3.0         Pulled
+Volume ..._kafka_data            Created
+Network ..._default              Created
+Container bnh-kafka              Started
+```
+
+Verificar:
+
+```bash
+docker ps
+```
+
+Debe aparecer:
+
+```text
+bnh-kafka
+```
+
+con estado:
+
+```text
+Up
+```
+
+y el puerto:
+
+```text
+0.0.0.0:9092->9092/tcp
+```
+
+---
+
+## 4. Verificar que Kafka terminó de iniciar
+
+### Para qué
+
+Que el contenedor esté `Up` no garantiza que Kafka internamente haya terminado de inicializar.
+
+### Comando
+
+```bash
+docker logs --tail 100 bnh-kafka
+```
+
+### Resultado esperado
+
+Buscar estas líneas o equivalentes:
+
+```text
+The broker has been unfenced
+Transitioning from RECOVERY to RUNNING
+Endpoint is now READY
+Transition from STARTING to STARTED
+Kafka Server started
+```
+
+Si aparece:
+
+```text
+Kafka Server started
+```
+
+el broker está operativo.
+
+---
+
+## 5. Comprobar conexión con Kafka
+
+### Para qué
+
+Validar que un cliente puede conectarse realmente al broker.
+
+### Comando
+
+```bash
+docker exec bnh-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --list
+```
+
+### Resultado esperado
+
+La primera vez no debería mostrar ningún topic.
+
+Una salida vacía es correcta.
+
+---
+
+## 6. Crear el topic `bnh.personas`
+
+### Para qué
+
+Crear el primer canal de eventos del laboratorio.
+
+Vamos a utilizar tres particiones para poder observar cómo Kafka distribuye los registros.
+
+### Comando
+
+```bash
+docker exec bnh-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --create \
+  --topic bnh.personas \
+  --partitions 3 \
+  --replication-factor 1
+```
+
+### Resultado esperado
+
+```text
+Created topic bnh.personas.
+```
+
+Puede aparecer además un warning relacionado con nombres de topics que utilizan `.` o `_`. Para este laboratorio no afecta.
+
+Usamos:
+
+```text
+replication-factor = 1
+```
+
+porque actualmente tenemos un solo broker.
+
+---
+
+## 7. Inspeccionar el topic
+
+### Para qué
+
+Comprobar que existen las tres particiones.
+
+### Comando
+
+```bash
+docker exec bnh-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --describe \
+  --topic bnh.personas
+```
+
+### Resultado esperado
+
+Debe contener:
+
+```text
+PartitionCount: 3
+ReplicationFactor: 1
+```
+
+y:
+
+```text
+Partition: 0
+Partition: 1
+Partition: 2
+```
+
+Como tenemos un único broker, las tres particiones deberían mostrar:
+
+```text
+Leader: 1
+Replicas: 1
+Isr: 1
+```
+
+La situación actual es:
+
+```text
+Kafka Cluster
+└── Broker 1
+    ├── bnh.personas / Partition 0
+    ├── bnh.personas / Partition 1
+    └── bnh.personas / Partition 2
+```
+
+---
+
+## 8. Abrir un producer Kafka
+
+### Para qué
+
+Enviar mensajes manualmente al topic usando una `key` por persona.
+
+### Comando
+
+```bash
+docker exec -it bnh-kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic bnh.personas \
+  --property parse.key=true \
+  --property key.separator=":"
+```
+
+El proceso queda esperando mensajes.
+
+---
+
+## 9. Publicar eventos
+
+Ingresar estas líneas:
+
+```text
+P001:{"id":"P001","nombre":"Ana","jurisdiccion":"ARG-B"}
+P002:{"id":"P002","nombre":"Juan","jurisdiccion":"ARG-B"}
+P003:{"id":"P003","nombre":"Lucia","jurisdiccion":"ARG-B"}
+P004:{"id":"P004","nombre":"Pedro","jurisdiccion":"ARG-B"}
+P005:{"id":"P005","nombre":"Maria","jurisdiccion":"ARG-B"}
+P006:{"id":"P006","nombre":"Sofia","jurisdiccion":"ARG-B"}
+```
+
+Cada línea tiene:
+
+```text
+KEY:VALUE
+```
+
+Ejemplo:
+
+```text
+P001:{"id":"P001", ...}
+```
+
+donde:
+
+```text
+P001                         → key
+{"id":"P001", ...}           → value
+```
+
+Salir del producer con:
+
+```text
+Ctrl+C
+```
+
+---
+
+## 10. Consumir los eventos
+
+### Para qué
+
+Leer los mensajes desde el inicio y observar:
+
+* key;
+* partición;
+* offset;
+* contenido.
+
+### Comando
+
+```bash
+docker exec bnh-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic bnh.personas \
+  --from-beginning \
+  --max-messages 6 \
+  --formatter-property print.key=true \
+  --formatter-property print.partition=true \
+  --formatter-property print.offset=true
+```
+
+### Resultado esperado
+
+Los mensajes deberían estar distribuidos entre las tres particiones.
+
+En la primera ejecución del laboratorio obtuvimos:
+
+```text
+Partition:0 Offset:0 P003 {"id":"P003","nombre":"Lucia","jurisdiccion":"ARG-B"}
+Partition:0 Offset:1 P005 {"id":"P005","nombre":"Maria","jurisdiccion":"ARG-B"}
+
+Partition:1 Offset:0 P002 {"id":"P002","nombre":"Juan","jurisdiccion":"ARG-B"}
+Partition:1 Offset:1 P006 {"id":"P006","nombre":"Sofia","jurisdiccion":"ARG-B"}
+
+Partition:2 Offset:0 P001 {"id":"P001","nombre":"Ana","jurisdiccion":"ARG-B"}
+Partition:2 Offset:1 P004 {"id":"P004","nombre":"Pedro","jurisdiccion":"ARG-B"}
+```
+
+La distribución exacta debe ser consistente para las mismas keys y configuración, pero lo importante a validar es que Kafka tenga los seis mensajes distribuidos entre las particiones.
+
+Conceptualmente:
+
+```text
+bnh.personas
+
+Partition 0
+├── offset 0
+└── offset 1
+
+Partition 1
+├── offset 0
+└── offset 1
+
+Partition 2
+├── offset 0
+└── offset 1
+```
+
+Los offsets son independientes para cada partición.
+
+---
+
+## 11. Detener el laboratorio
+
+### Mantener los datos
+
+Para detener y eliminar los contenedores y la red, conservando el volumen Kafka:
+
+```bash
+docker compose down
+```
+
+Al volver a ejecutar:
+
+```bash
+docker compose up -d kafka
+```
+
+los datos deberían seguir disponibles.
+
+### Reiniciar completamente
+
+Solo cuando se quiera eliminar también toda la información almacenada por Kafka:
+
+```bash
+docker compose down -v
+```
+
+Esto elimina el volumen:
+
+```text
+kafka_data
+```
+
+y la próxima ejecución comienza desde cero.
+
+---
+
+## Estado de la etapa
+
+Al completar estos pasos queda validado:
+
+```text
+Docker Compose
+      ↓
+Kafka 4.3 / KRaft
+      ↓
+Topic bnh.personas
+      ↓
+3 particiones
+      ↓
+Producer manual
+      ↓
+Eventos con key
+      ↓
+Consumer manual
+      ↓
+Distribución por particiones
+```
+
+Siguiente etapa:
+
+```text
+Producer Python
+      ↓
+Kafka
+      ↓
+Consumer Python
+```
+
+El `compose.yaml` continuará creciendo sobre esta misma base; no se crearán laboratorios aislados para cada tecnología.
+
+---
+---
+
+## Etapa 2 — Producer y Consumer Python
+
+Objetivo de esta etapa:
+
+* publicar eventos Kafka desde Python;
+* consumirlos desde Python;
+* verificar particiones y offsets;
+* comprobar consumer groups;
+* validar reparto de particiones entre múltiples consumers;
+* comprobar rebalance cuando un consumer se cae.
+
+---
+
+## 1. Estructura
+
+```text
+apps/
+├── producer/
+│   ├── Dockerfile
+│   ├── producer.py
+│   └── requirements.txt
+│
+└── consumer/
+    ├── Dockerfile
+    ├── consumer.py
+    └── requirements.txt
+```
+
+---
+
+## 2. Producer Python
+
+### `apps/producer/requirements.txt`
+
+```txt
+confluent-kafka==2.15.0
+```
+
+### `apps/producer/Dockerfile`
+
+```dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY producer.py .
+
+CMD ["python", "producer.py"]
+```
+
+### `apps/producer/producer.py`
+
+```python
+import json
+
+from confluent_kafka import Producer
+
+
+producer = Producer(
+    {
+        "bootstrap.servers": "kafka:19092",
+    }
+)
+
+personas = [
+    {"id": "P101", "nombre": "Carlos", "jurisdiccion": "ARG-B"},
+    {"id": "P102", "nombre": "Laura", "jurisdiccion": "ARG-B"},
+    {"id": "P103", "nombre": "Martin", "jurisdiccion": "ARG-B"},
+]
+
+
+def delivery_report(err, msg):
+    if err:
+        print(f"ERROR: {err}")
+        return
+
+    print(
+        f"OK key={msg.key().decode()} "
+        f"partition={msg.partition()} "
+        f"offset={msg.offset()}"
+    )
+
+
+for persona in personas:
+    producer.produce(
+        topic="bnh.personas",
+        key=persona["id"],
+        value=json.dumps(persona),
+        callback=delivery_report,
+    )
+
+producer.flush()
+```
+
+### Qué valida
+
+Cada persona se publica como un evento independiente en:
+
+```text
+bnh.personas
+```
+
+usando el ID como `key`.
+
+Ejemplo:
+
+```text
+P101 → Kafka
+P102 → Kafka
+P103 → Kafka
+```
+
+El producer usa:
+
+```text
+kafka:19092
+```
+
+porque corre dentro de la misma red Docker que Kafka.
+
+---
+
+## 3. Consumer Python
+
+### `apps/consumer/requirements.txt`
+
+```txt
+confluent-kafka==2.15.0
+```
+
+### `apps/consumer/Dockerfile`
+
+```dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY consumer.py .
+
+CMD ["python", "consumer.py"]
+```
+
+### `apps/consumer/consumer.py`
+
+```python
+import json
+
+from confluent_kafka import Consumer
+
+
+consumer = Consumer(
+    {
+        "bootstrap.servers": "kafka:19092",
+        "group.id": "bnh-personas-consumer",
+        "auto.offset.reset": "earliest",
+    }
+)
+
+consumer.subscribe(["bnh.personas"])
+
+print("Esperando eventos de bnh.personas...")
+
+try:
+    while True:
+        msg = consumer.poll(1.0)
+
+        if msg is None:
+            continue
+
+        if msg.error():
+            print(f"ERROR: {msg.error()}")
+            continue
+
+        persona = json.loads(msg.value().decode("utf-8"))
+
+        print(
+            f"key={msg.key().decode()} "
+            f"partition={msg.partition()} "
+            f"offset={msg.offset()} "
+            f"persona={persona}"
+        )
+
+finally:
+    consumer.close()
+```
+
+---
+
+## 4. Servicios en `compose.yaml`
+
+Agregar:
+
+```yaml
+  producer:
+    build:
+      context: ./apps/producer
+    container_name: bnh-producer
+    depends_on:
+      - kafka
+    restart: "no"
+
+  consumer:
+    build:
+      context: ./apps/consumer
+    container_name: bnh-consumer
+    depends_on:
+      - kafka
+    restart: "no"
+```
+
+---
+
+## 5. Validar Compose
+
+### Para qué
+
+Confirmar que los nuevos servicios están correctamente definidos.
+
+```bash
+docker compose config
+```
+
+### Resultado esperado
+
+Deben aparecer:
+
+```text
+producer
+consumer
+kafka
+```
+
+sin errores de configuración.
+
+---
+
+## 6. Construir producer
+
+```bash
+docker compose build producer
+```
+
+### Resultado esperado
+
+```text
+Image bnh-laboratory-producer Built
+```
+
+---
+
+## 7. Ejecutar producer
+
+```bash
+docker compose run --rm producer
+```
+
+### Resultado esperado
+
+Algo similar a:
+
+```text
+OK key=P103 partition=1 offset=2
+OK key=P102 partition=2 offset=2
+OK key=P101 partition=0 offset=2
+```
+
+Las particiones concretas dependen de la key y configuración actual.
+
+---
+
+## 8. Verificar mensajes desde Kafka
+
+```bash
+docker exec bnh-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic bnh.personas \
+  --from-beginning \
+  --formatter-property print.key=true \
+  --formatter-property print.partition=true \
+  --formatter-property print.offset=true
+```
+
+### Para qué
+
+Confirmar que los eventos producidos desde Python fueron persistidos correctamente por Kafka.
+
+---
+
+## 9. Construir consumer
+
+```bash
+docker compose build consumer
+```
+
+### Resultado esperado
+
+```text
+Image bnh-laboratory-consumer Built
+```
+
+---
+
+## 10. Ejecutar consumer
+
+```bash
+docker compose run --rm consumer
+```
+
+### Resultado esperado
+
+El consumer lee los eventos existentes y luego queda esperando nuevos mensajes.
+
+Ejemplo:
+
+```text
+Esperando eventos de bnh.personas...
+
+key=P001 partition=2 offset=0 persona={...}
+key=P004 partition=2 offset=1 persona={...}
+key=P102 partition=2 offset=2 persona={...}
+```
+
+No termina automáticamente.
+
+Salir con:
+
+```text
+Ctrl+C
+```
+
+---
+
+## 11. Probar consumo en vivo
+
+Dejar el consumer ejecutándose.
+
+En otra terminal:
+
+```bash
+docker compose run --rm producer
+```
+
+### Resultado esperado
+
+El producer publica nuevos eventos y el consumer los muestra automáticamente.
+
+Esto valida:
+
+```text
+Producer Python
+      ↓
+    Kafka
+      ↓
+Consumer Python
+```
+
+---
+
+## 12. Verificar Consumer Group
+
+Con el consumer todavía corriendo:
+
+```bash
+docker exec bnh-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --describe \
+  --group bnh-personas-consumer
+```
+
+### Resultado esperado
+
+Ejemplo:
+
+```text
+PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+0          4               4               0
+1          4               4               0
+2          4               4               0
+```
+
+### Interpretación
+
+`CURRENT-OFFSET`
+
+Posición hasta la que avanzó el consumer group.
+
+`LOG-END-OFFSET`
+
+Próxima posición disponible en la partición.
+
+`LAG`
+
+Cantidad de mensajes pendientes.
+
+Si:
+
+```text
+LAG = 0
+```
+
+el consumer está al día.
+
+---
+
+## 13. Probar múltiples consumers
+
+Mantener el primer consumer ejecutándose y abrir un segundo:
+
+```bash
+docker compose run --rm consumer
+```
+
+Ambos utilizan:
+
+```text
+group.id = bnh-personas-consumer
+```
+
+por lo tanto Kafka los considera parte del mismo consumer group.
+
+Volver a inspeccionar:
+
+```bash
+docker exec bnh-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --describe \
+  --group bnh-personas-consumer
+```
+
+### Resultado esperado
+
+Con 3 particiones y 2 consumers:
+
+```text
+Consumer A
+├── Partition 0
+└── Partition 1
+
+Consumer B
+└── Partition 2
+```
+
+La distribución concreta puede variar.
+
+---
+
+## 14. Probar paralelismo
+
+Con los dos consumers ejecutándose:
+
+```bash
+docker compose run --rm producer
+```
+
+En la prueba realizada:
+
+```text
+P101 → Partition 0
+P102 → Partition 2
+P103 → Partition 1
+```
+
+Por lo tanto:
+
+```text
+Consumer A
+├── P101
+└── P103
+
+Consumer B
+└── P102
+```
+
+Cada consumer procesa solamente las particiones que Kafka le asignó.
+
+---
+
+## 15. Probar rebalance por caída
+
+Detener uno de los consumers:
+
+```text
+Ctrl+C
+```
+
+Después:
+
+```bash
+docker exec bnh-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --describe \
+  --group bnh-personas-consumer
+```
+
+### Resultado esperado
+
+Kafka reasigna las particiones del consumer que desapareció al consumer que sigue activo.
+
+Ejemplo:
+
+Antes:
+
+```text
+Consumer A → Partition 0, 1
+Consumer B → Partition 2
+```
+
+Después:
+
+```text
+Consumer A → Partition 0, 1, 2
+```
+
+Esto confirma el rebalance automático del consumer group.
+
+---
+
+## Resultado de la etapa
+
+Quedó validado:
+
+```text
+Producer Python
+      ↓
+    Kafka
+      ↓
+Consumer Group Python
+      ├── particiones
+      ├── offsets
+      ├── lag
+      ├── paralelismo
+      └── rebalance
+```
+
+También quedó comprobado que eventos con la misma `key` mantienen la misma partición mientras se conserve la configuración actual de particiones.
+
+Ejemplo observado:
+
+```text
+P101 → Partition 0
+P102 → Partition 2
+P103 → Partition 1
+```
+
+al volver a publicar esas mismas keys.
+
+---
+
+## Detener el laboratorio
+
+Cerrar los consumers activos con:
+
+```text
+Ctrl+C
+```
+
+Después:
+
+```bash
+docker compose down
+```
+
+Esto elimina contenedores y red, pero mantiene el volumen Kafka.
+
+Para borrar también todos los datos:
+
+```bash
+docker compose down -v
+```
+
+Usar `-v` únicamente cuando se quiera reiniciar el laboratorio completamente.
+
+---
+
+## Siguiente etapa
+
+Reemplazar el producer fijo por una API Python:
+
+```text
+POST /personas
+      ↓
+API Python
+      ↓
+publica un evento Kafka por registro
+      ↓
+Kafka
+      ↓
+Consumer
+```
+
+---
+---
+## Etapa 3 — API REST → Kafka
+
+Objetivo de esta etapa:
+
+* reemplazar el producer de prueba por una API HTTP;
+* recibir un lote JSON;
+* publicar un evento Kafka por cada registro;
+* conservar metadata del lote;
+* validar el flujo completo usando el consumer Python existente.
+
+Flujo validado:
+
+```text
+Cliente HTTP
+     ↓
+API Python
+     ↓
+Kafka
+     ↓
+Consumer Python
+```
+
+---
+
+## 1. Estructura
+
+Agregar:
+
+```text
+apps/
+├── api/
+│   ├── Dockerfile
+│   ├── api.py
+│   └── requirements.txt
+│
+├── producer/
+└── consumer/
+```
+
+---
+
+## 2. API Python
+
+### `apps/api/requirements.txt`
+
+```txt
+fastapi
+uvicorn[standard]
+confluent-kafka==2.15.0
+```
+
+### `apps/api/Dockerfile`
+
+```dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY api.py .
+
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+### `apps/api/api.py`
+
+```python
+import json
+
+from confluent_kafka import Producer
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+
+app = FastAPI(title="BNH Laboratory API")
+
+
+producer = Producer(
+    {
+        "bootstrap.servers": "kafka:19092",
+    }
+)
+
+
+class Metadata(BaseModel):
+    jurisdiccion: str
+    dominio: str
+    lote_id: str
+
+
+class Persona(BaseModel):
+    id: str
+    nombre: str
+
+
+class PersonasPayload(BaseModel):
+    metadata: Metadata
+    registros: list[Persona]
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/personas", status_code=202)
+def crear_personas(payload: PersonasPayload):
+    for persona in payload.registros:
+        evento = {
+            "metadata": payload.metadata.model_dump(),
+            "registro": persona.model_dump(),
+        }
+
+        key = f"{payload.metadata.jurisdiccion}:{persona.id}"
+
+        producer.produce(
+            topic="bnh.personas",
+            key=key,
+            value=json.dumps(evento),
+        )
+
+    producer.flush()
+
+    return {
+        "status": "accepted",
+        "lote_id": payload.metadata.lote_id,
+        "cantidad_registros": len(payload.registros),
+    }
+```
+
+### Qué hace
+
+La API recibe un lote:
+
+```text
+1 request REST
+    ↓
+3 personas
+```
+
+y publica:
+
+```text
+3 eventos Kafka
+```
+
+Ejemplo:
+
+```text
+ARG-B:P201 → evento 1
+ARG-B:P202 → evento 2
+ARG-B:P203 → evento 3
+```
+
+La `key` utilizada es:
+
+```text
+jurisdiccion:id_persona
+```
+
+por ejemplo:
+
+```text
+ARG-B:P201
+```
+
+---
+
+## 3. Agregar API al `compose.yaml`
+
+Dentro de `services:`:
+
+```yaml
+  api:
+    build:
+      context: ./apps/api
+    container_name: bnh-api
+    depends_on:
+      - kafka
+    ports:
+      - "8000:8000"
+    restart: "no"
+```
+
+La API se comunica con Kafka mediante:
+
+```text
+kafka:19092
+```
+
+y queda expuesta al host mediante:
+
+```text
+localhost:8000
+```
+
+---
+
+## 4. Validar Compose
+
+### Para qué
+
+Confirmar que el servicio API fue agregado correctamente.
+
+### Comando
+
+```bash
+docker compose config
+```
+
+### Resultado esperado
+
+Deben aparecer:
+
+```text
+api
+consumer
+producer
+kafka
+```
+
+sin errores de configuración.
+
+---
+
+## 5. Construir la API
+
+### Comando
+
+```bash
+docker compose build api
+```
+
+### Resultado esperado
+
+Algo similar a:
+
+```text
+Image bnh-laboratory-api Built
+```
+
+---
+
+## 6. Levantar Kafka + API
+
+### Comando
+
+```bash
+docker compose up -d kafka api
+```
+
+### Verificar
+
+```bash
+docker ps
+```
+
+### Resultado esperado
+
+Deben aparecer:
+
+```text
+bnh-kafka
+bnh-api
+```
+
+con estado:
+
+```text
+Up
+```
+
+La API debe exponer:
+
+```text
+0.0.0.0:8000->8000/tcp
+```
+
+---
+
+## 7. Validar `/health`
+
+### Para qué
+
+Comprobar que la API HTTP está operativa antes de probar Kafka.
+
+### Comando
+
+```bash
+curl http://localhost:8000/health
+```
+
+### Resultado esperado
+
+```json
+{"status":"ok"}
+```
+
+---
+
+## 8. Levantar consumer
+
+En otra terminal:
+
+```bash
+docker compose run --rm consumer
+```
+
+### Resultado esperado
+
+Debe quedar escuchando:
+
+```text
+Esperando eventos de bnh.personas...
+```
+
+Puede mostrar eventos anteriores almacenados en Kafka.
+
+Dejarlo corriendo.
+
+---
+
+## 9. Enviar lote de Personas por REST
+
+En otra terminal:
+
+```bash
+curl -X POST http://localhost:8000/personas \
+  -H "Content-Type: application/json" \
+  -d '{
+    "metadata": {
+      "jurisdiccion": "ARG-B",
+      "dominio": "persona",
+      "lote_id": "L-REST-001"
+    },
+    "registros": [
+      {
+        "id": "P201",
+        "nombre": "Julieta"
+      },
+      {
+        "id": "P202",
+        "nombre": "Nicolas"
+      },
+      {
+        "id": "P203",
+        "nombre": "Valentina"
+      }
+    ]
+  }'
+```
+
+---
+
+## 10. Resultado esperado de la API
+
+```json
+{
+  "status": "accepted",
+  "lote_id": "L-REST-001",
+  "cantidad_registros": 3
+}
+```
+
+Esto confirma que la API recibió un único lote con tres registros.
+
+---
+
+## 11. Resultado esperado en Kafka
+
+El consumer debe recibir tres eventos independientes.
+
+Ejemplo conceptual:
+
+```text
+key=ARG-B:P201 ... persona={...}
+key=ARG-B:P202 ... persona={...}
+key=ARG-B:P203 ... persona={...}
+```
+
+Cada registro del request REST se convierte en un mensaje Kafka independiente.
+
+Flujo:
+
+```text
+POST /personas
+
+L-REST-001
+├── P201
+├── P202
+└── P203
+
+        ↓
+
+API
+
+        ↓
+
+Kafka
+
+├── evento ARG-B:P201
+├── evento ARG-B:P202
+└── evento ARG-B:P203
+```
+
+---
+
+## 12. Metadata conservada
+
+Cada evento enviado a Kafka contiene:
+
+```json
+{
+  "metadata": {
+    "jurisdiccion": "ARG-B",
+    "dominio": "persona",
+    "lote_id": "L-REST-001"
+  },
+  "registro": {
+    "id": "P201",
+    "nombre": "Julieta"
+  }
+}
+```
+
+De esta forma cada registro conserva trazabilidad respecto del lote HTTP original.
+
+---
+
+## Resultado de la etapa
+
+Quedó validado:
+
+```text
+Cliente REST
+     ↓
+API Python
+     ↓
+1 lote JSON
+     ↓
+N eventos Kafka
+     ↓
+Consumer Python
+```
+
+También quedó comprobado que:
+
+* la API puede comunicarse con Kafka por la red interna Docker;
+* un request puede generar varios eventos;
+* cada registro puede tener su propia key;
+* los datos mantienen metadata del lote;
+* el consumer recibe los eventos en tiempo real.
+
+---
+
+## Detener la etapa
+
+Cerrar el consumer:
+
+```text
+Ctrl+C
+```
+
+Luego:
+
+```bash
+docker compose down
+```
+
+Esto mantiene el volumen Kafka.
+
+Para eliminar también los datos:
+
+```bash
+docker compose down -v
+```
+
+---
+
+## Siguiente etapa
+
+Agregar Apache NiFi como segundo mecanismo de ingesta:
+
+```text
+API REST ───────────────┐
+                        ▼
+                       Kafka
+                        ▲
+CSV / archivo → NiFi ───┘
+```
+
+Objetivo:
+
+* levantar NiFi;
+* validar acceso a su UI;
+* procesar un CSV;
+* transformar registros;
+* publicar esos registros en `bnh.personas`;
+* comprobar que Kafka recibe datos tanto por API como por archivo.
+
+---
+---
+
+## Etapa 4 — Ingesta de archivos con Apache NiFi
+
+En esta etapa se incorporó **Apache NiFi 2.11.0** al laboratorio para validar un segundo canal de ingreso de datos hacia Kafka.
+
+Hasta esta etapa existían:
+
+- productor Python → Kafka;
+- consumer Python ← Kafka;
+- API REST → Kafka.
+
+Ahora se agregó:
+
+```text
+Archivo CSV
+    ↓
+Apache NiFi
+    ↓
+Kafka
+    ↓
+Consumer Python
+```
+
+El objetivo es simular la recepción de archivos de una jurisdicción y transformar cada registro recibido en un mensaje Kafka independiente.
+
+> Esta configuración corresponde al laboratorio local. No representa todavía el contrato definitivo de intercambio ni una configuración productiva de NiFi.
+
+---
+
+### 4.1 Servicio NiFi
+
+Se agregó al `compose.yaml`:
+
+```yaml
+nifi:
+  image: apache/nifi:2.11.0
+  container_name: bnh-nifi
+  hostname: nifi
+
+  depends_on:
+    - kafka
+
+  ports:
+    - "8443:8443"
+
+  environment:
+    SINGLE_USER_CREDENTIALS_USERNAME: admin
+    SINGLE_USER_CREDENTIALS_PASSWORD: BnhLaboratory1234
+
+  volumes:
+    - ./data/incoming:/data/incoming
+    - nifi_conf:/opt/nifi/nifi-current/conf
+    - nifi_state:/opt/nifi/nifi-current/state
+    - nifi_database:/opt/nifi/nifi-current/database_repository
+    - nifi_flowfile:/opt/nifi/nifi-current/flowfile_repository
+    - nifi_content:/opt/nifi/nifi-current/content_repository
+    - nifi_provenance:/opt/nifi/nifi-current/provenance_repository
+
+  restart: "no"
+```
+
+Y los siguientes volúmenes:
+
+```yaml
+volumes:
+  kafka_data:
+  nifi_conf:
+  nifi_state:
+  nifi_database:
+  nifi_flowfile:
+  nifi_content:
+  nifi_provenance:
+```
+
+Los volúmenes permiten conservar configuración, estado y repositories de NiFi entre recreaciones del contenedor.
+
+El directorio:
+
+```text
+./data/incoming
+```
+
+se monta como:
+
+```text
+/data/incoming
+```
+
+dentro del contenedor.
+
+Esto permite que los archivos generados desde el host sean visibles directamente por NiFi.
+
+---
+
+### 4.2 Inicio
+
+Levantar Kafka y NiFi:
+
+```bash
+docker compose up -d kafka nifi
+```
+
+La interfaz web queda disponible en:
+
+```text
+https://localhost:8443/nifi
+```
+
+El certificado es autofirmado, por lo que el navegador puede mostrar una advertencia.
+
+Credenciales del laboratorio:
+
+```text
+Usuario: admin
+Password: BnhLaboratory1234
+```
+
+Estas credenciales son únicamente para desarrollo local.
+
+---
+
+### 4.3 Landing de archivos
+
+Se creó la estructura:
+
+```text
+data/
+└── incoming/
+    └── personas/
+```
+
+Ejemplo de archivo de entrada:
+
+```csv
+id,nombre,jurisdiccion
+P401,Carolina,ARG-B
+P402,Diego,ARG-B
+P403,Florencia,ARG-B
+```
+
+Ubicación:
+
+```text
+data/incoming/personas/personas.csv
+```
+
+Dentro de NiFi el mismo archivo queda disponible en:
+
+```text
+/data/incoming/personas/personas.csv
+```
+
+---
+
+### 4.4 Flujo NiFi
+
+Se construyó manualmente el siguiente flujo:
+
+```text
+                         ┌─────────────┐
+                    ┌───→│  LogErrors  │
+                    │    └─────────────┘
+                    │
+GetFile
+   │ success
+   ▼
+SplitRecord
+   │ splits
+   ▼
+EvaluateJsonPath
+   │ matched
+   ▼
+PublishKafka
+   │
+   ▼
+Kafka: bnh.personas
+```
+
+Las relaciones `failure` de los processors principales se envían a `LogErrors`.
+
+> El flujo vigente, alineado al contrato Persona, inserta `JoltTransformJSON`
+> entre `SplitRecord` y `EvaluateJsonPath` para emitir `{metadata, registro}`.
+> Ver la sección de validación de Persona.
+
+---
+
+### 4.5 GetFile
+
+Processor:
+
+```text
+GetFile
+```
+
+Configuración:
+
+```text
+Input Directory: /data/incoming/personas
+Recurse Subdirectories: false
+Keep Source File: false
+```
+
+Su función es detectar archivos en la landing y convertirlos en FlowFiles de NiFi.
+
+Con `Keep Source File = false`, el archivo se elimina de la landing una vez incorporado correctamente al flujo de NiFi.
+
+---
+
+### 4.6 SplitRecord
+
+Processor:
+
+```text
+SplitRecord
+```
+
+Se configuró para convertir un archivo CSV con múltiples registros en un FlowFile independiente por registro.
+
+Controller Services utilizados:
+
+```text
+CSVReader
+JsonRecordSetWriter
+```
+
+#### CSVReader
+
+Configuración principal:
+
+```text
+Schema Access Strategy:
+Use String Fields From Header
+```
+
+La primera fila del CSV se interpreta como encabezado y todos los campos se manejan inicialmente como strings.
+
+#### JsonRecordSetWriter
+
+Configuración:
+
+```text
+Schema Access Strategy:
+Inherit Record Schema
+
+Output Grouping:
+One Line Per Object
+
+Pretty Print JSON:
+false
+```
+
+#### SplitRecord
+
+Configuración:
+
+```text
+Record Reader: CSVReader
+Record Writer: JsonRecordSetWriter
+Records Per Split: 1
+```
+
+De esta forma:
+
+```text
+personas.csv
+    │
+    ▼
+SplitRecord
+    ├── P401
+    ├── P402
+    └── P403
+```
+
+Cada persona continúa por el pipeline como un FlowFile independiente.
+
+Relaciones:
+
+```text
+splits   → EvaluateJsonPath
+failure  → LogErrors
+original → terminate
+```
+
+---
+
+### 4.7 EvaluateJsonPath
+
+Processor:
+
+```text
+EvaluateJsonPath
+```
+
+Su función es obtener del JSON los campos necesarios para construir la key del mensaje Kafka.
+
+Configuración:
+
+```text
+Destination:
+flowfile-attribute
+```
+
+Propiedades dinámicas:
+
+```text
+persona.id
+$.id
+```
+
+```text
+persona.jurisdiccion
+$.jurisdiccion
+```
+
+Ejemplo:
+
+Contenido del FlowFile:
+
+```json
+{"id":"P401","nombre":"Carolina","jurisdiccion":"ARG-B"}
+```
+
+Atributos generados:
+
+```text
+persona.id = P401
+persona.jurisdiccion = ARG-B
+```
+
+Relaciones:
+
+```text
+matched → PublishKafka
+failure → LogErrors
+```
+
+---
+
+### 4.8 Kafka3ConnectionService
+
+Para que NiFi pueda publicar en Kafka se creó:
+
+```text
+Kafka3ConnectionService
+```
+
+Configuración:
+
+```text
+Bootstrap Servers:
+kafka:19092
+
+Security Protocol:
+PLAINTEXT
+```
+
+Se utiliza `kafka:19092` porque NiFi y Kafka se encuentran dentro de la misma red Docker Compose.
+
+El listener:
+
+```text
+localhost:9092
+```
+
+queda reservado para clientes que ejecutan desde el host.
+
+---
+
+### 4.9 PublishKafka
+
+Processor:
+
+```text
+PublishKafka
+```
+
+Configuración:
+
+```text
+Kafka Connection Service:
+Kafka3ConnectionService
+
+Topic Name:
+bnh.personas
+```
+
+Key Kafka:
+
+```text
+${persona.jurisdiccion}:${persona.id}
+```
+
+Ejemplo:
+
+```text
+ARG-B:P401
+```
+
+Esto mantiene el mismo criterio de key utilizado anteriormente por los productores Python.
+
+Relaciones:
+
+```text
+success → terminate
+failure → LogErrors
+```
+
+---
+
+### 4.10 LogErrors
+
+Processor:
+
+```text
+LogAttribute
+```
+
+Nombre utilizado en el flujo:
+
+```text
+LogErrors
+```
+
+Recibe los FlowFiles enviados por las relaciones `failure`.
+
+Flujos de error:
+
+```text
+SplitRecord.failure ────────┐
+                            │
+EvaluateJsonPath.failure ───┼──→ LogErrors
+                            │
+PublishKafka.failure ───────┘
+```
+
+La relación:
+
+```text
+success
+```
+
+de `LogErrors` se encuentra configurada como `terminate`.
+
+---
+
+### 4.11 Prueba end-to-end
+
+Se dejó un consumer Python escuchando el topic:
+
+```bash
+docker compose run --rm consumer
+```
+
+Salida inicial:
+
+```text
+Esperando eventos de bnh.personas...
+```
+
+Luego se creó:
+
+```bash
+cat > data/incoming/personas/personas.csv <<'EOF'
+id,nombre,jurisdiccion
+P401,Carolina,ARG-B
+P402,Diego,ARG-B
+P403,Florencia,ARG-B
+EOF
+```
+
+NiFi detectó automáticamente el archivo y ejecutó:
+
+```text
+CSV
+ ↓
+GetFile
+ ↓
+SplitRecord
+ ↓
+EvaluateJsonPath
+ ↓
+PublishKafka
+ ↓
+Kafka
+ ↓
+Consumer Python
+```
+
+Resultado observado:
+
+```text
+key=ARG-B:P402 partition=0 offset=10 persona={'id': 'P402', 'nombre': 'Diego', 'jurisdiccion': 'ARG-B'}
+
+key=ARG-B:P401 partition=1 offset=8 persona={'id': 'P401', 'nombre': 'Carolina', 'jurisdiccion': 'ARG-B'}
+
+key=ARG-B:P403 partition=1 offset=9 persona={'id': 'P403', 'nombre': 'Florencia', 'jurisdiccion': 'ARG-B'}
+```
+
+Con esto quedó validado:
+
+```text
+Archivo CSV
+    ↓
+NiFi
+    ↓
+Kafka
+    ↓
+Consumer Python
+```
+
+con **un mensaje Kafka por persona** y una key formada por:
+
+```text
+jurisdiccion:id_persona
+```
+
+---
+
+### 4.12 Consumer groups durante la prueba
+
+Durante la primera ejecución había dos consumers activos utilizando:
+
+```text
+group.id = bnh-personas-consumer
+```
+
+Kafka repartió las particiones entre ambos consumers, por lo que la terminal utilizada para la prueba no mostraba todos los mensajes.
+
+Se verificó mediante:
+
+```bash
+docker exec bnh-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --describe \
+  --group bnh-personas-consumer
+```
+
+Luego de dejar un único consumer activo, este tomó las tres particiones:
+
+```text
+partition 0 → consumer
+partition 1 → consumer
+partition 2 → consumer
+```
+
+con:
+
+```text
+LAG = 0
+```
+
+Esto confirmó también el comportamiento de rebalanceo de Kafka Consumer Groups validado en etapas anteriores.
+
+---
+
+### 4.13 Estado de la etapa
+
+Validado:
+
+```text
+CSV → NiFi → Kafka → Consumer
+```
+
+También se comprobó:
+
+- lectura de archivos desde una landing compartida;
+- separación de un archivo en registros independientes;
+- transformación CSV → JSON;
+- extracción de atributos desde JSON;
+- generación de Kafka keys;
+- publicación en `bnh.personas`;
+- distribución por particiones;
+- manejo básico de ramas de error;
+- persistencia local de NiFi mediante Docker volumes.
+
+### Pendiente
+
+El flujo inicial se creó desde la interfaz web. La definición vigente quedó
+versionada en:
+
+```text
+nifi/flows/BNH_-_Personas_File_Ingestion.json
+```
+
+Para reconstruirla en otro entorno, importar el JSON (UI o
+`scripts/nifi/import_personas_flow.py`) y habilitar los Controller Services.
+
+La alineación posterior al contrato `{metadata, registro}` está documentada
+en la sección de validación de Persona.
+
+---
+---
+
+## Etapa 5 — Ingesta gRPC con client streaming
+
+En esta etapa se incorporó **gRPC** como segundo contrato público de integración programática de BNH.
+
+La decisión funcional es que **REST y gRPC coexistirán como contratos públicos**. gRPC no reemplaza REST.
+
+El objetivo del laboratorio es validar este flujo:
+
+```text
+Cliente gRPC
+    │
+    │ client streaming
+    ▼
+Servidor gRPC Python
+    │
+    ▼
+Kafka
+    │
+    ▼
+bnh.personas
+```
+
+El canal de archivos con NiFi continúa siendo independiente:
+
+```text
+REST ─────┐
+          │
+gRPC ─────┼──→ Kafka
+          │
+NiFi ─────┘
+```
+
+> El contrato utilizado en esta etapa es simplificado y corresponde al laboratorio. No representa todavía el contrato definitivo de Personas de BNH.
+
+---
+
+### 5.1 Estructura
+
+Se agregó la siguiente estructura:
+
+```text
+contracts/
+└── grpc/
+    └── personas/
+        └── v1/
+            └── personas.proto
+
+apps/
+└── grpc/
+    ├── generated/
+    │   └── personas/
+    │       └── v1/
+    │           ├── personas_pb2.py
+    │           └── personas_pb2_grpc.py
+    ├── client/
+    │   ├── client.py
+    │   ├── Dockerfile
+    │   └── requirements.txt
+    └── server/
+        ├── server.py
+        ├── Dockerfile
+        └── requirements.txt
+```
+
+---
+
+### 5.2 Contrato Protobuf
+
+Archivo:
+
+```text
+contracts/grpc/personas/v1/personas.proto
+```
+
+Contenido:
+
+```protobuf
+syntax = "proto3";
+
+package bnh.personas.v1;
+
+
+message Metadata {
+  string jurisdiccion = 1;
+  string dominio = 2;
+  string lote_id = 3;
+}
+
+
+message Persona {
+  string id = 1;
+  string nombre = 2;
+}
+
+
+message CargaPersonaRequest {
+  Metadata metadata = 1;
+  Persona registro = 2;
+}
+
+
+message ResultadoCarga {
+  string lote_id = 1;
+  int32 cantidad_recibida = 2;
+  string estado = 3;
+}
+
+
+service PersonasService {
+  rpc EnviarPersonas(stream CargaPersonaRequest) returns (ResultadoCarga);
+}
+```
+
+El método:
+
+```protobuf
+rpc EnviarPersonas(stream CargaPersonaRequest) returns (ResultadoCarga);
+```
+
+implementa un RPC de tipo **client streaming**:
+
+```text
+Cliente
+  ├── request 1 ──→
+  ├── request 2 ──→
+  ├── request 3 ──→
+  └── request N ──→
+
+Cliente ←── una única respuesta final
+```
+
+Esto permite enviar múltiples registros utilizando un único stream gRPC.
+
+---
+
+### 5.3 Generación de código Python
+
+El archivo `.proto` se compila utilizando `grpcio-tools`.
+
+Para evitar instalar herramientas directamente en el host se utilizó Docker:
+
+```bash
+docker run --rm \
+  -v "$PWD:/workspace" \
+  -w /workspace \
+  python:3.12-slim \
+  sh -c "pip install --no-cache-dir grpcio-tools==1.83.0 && \
+  python -m grpc_tools.protoc \
+    -I contracts/grpc \
+    --python_out=apps/grpc/generated \
+    --grpc_python_out=apps/grpc/generated \
+    contracts/grpc/personas/v1/personas.proto"
+```
+
+Esto genera:
+
+```text
+personas_pb2.py
+personas_pb2_grpc.py
+```
+
+`personas_pb2.py` contiene las clases correspondientes a los mensajes Protobuf.
+
+`personas_pb2_grpc.py` contiene las clases necesarias para cliente y servidor gRPC:
+
+```text
+PersonasServiceStub
+PersonasServiceServicer
+add_PersonasServiceServicer_to_server
+```
+
+El código generado no debe editarse manualmente.
+
+---
+
+### 5.4 Dependencias
+
+Servidor:
+
+```text
+grpcio==1.83.0
+protobuf==7.35.1
+confluent-kafka==2.15.0
+```
+
+Cliente:
+
+```text
+grpcio==1.83.0
+protobuf==7.35.1
+```
+
+`grpcio-tools` se utiliza únicamente para generar código desde el `.proto` y no forma parte del runtime.
+
+---
+
+### 5.5 Servidor gRPC
+
+El servidor implementa:
+
+```python
+class PersonasService(
+    personas_pb2_grpc.PersonasServiceServicer
+):
+```
+
+El método:
+
+```python
+def EnviarPersonas(self, request_iterator, context):
+```
+
+recibe un iterador de mensajes provenientes del stream.
+
+Conceptualmente:
+
+```text
+request_iterator
+    │
+    ├── CargaPersonaRequest P501
+    ├── CargaPersonaRequest P502
+    └── CargaPersonaRequest P503
+```
+
+El servidor recorre los mensajes a medida que llegan:
+
+```python
+for request in request_iterator:
+    ...
+```
+
+y no necesita recibir el lote completo antes de empezar a procesarlo.
+
+---
+
+### 5.6 Integración con Kafka
+
+Por cada registro recibido por gRPC, el servidor genera un mensaje independiente en:
+
+```text
+bnh.personas
+```
+
+La Kafka key sigue el mismo criterio utilizado por REST y NiFi:
+
+```text
+jurisdiccion:id
+```
+
+Ejemplo:
+
+```text
+ARG-B:P501
+```
+
+El evento publicado tiene la forma:
+
+```json
+{
+  "metadata": {
+    "jurisdiccion": "ARG-B",
+    "dominio": "persona",
+    "lote_id": "L-GRPC-001"
+  },
+  "registro": {
+    "id": "P501",
+    "nombre": "Lucia"
+  }
+}
+```
+
+El producer utiliza el listener interno de Kafka:
+
+```text
+kafka:19092
+```
+
+porque ambos servicios se encuentran dentro de la red Docker Compose.
+
+---
+
+### 5.7 Respuesta gRPC
+
+Una vez finalizado el stream y publicados los mensajes en Kafka, el servidor responde:
+
+```text
+ResultadoCarga
+```
+
+Ejemplo:
+
+```text
+lote_id=L-GRPC-001
+cantidad_recibida=3
+estado=RECIBIDO
+```
+
+Para esta etapa del laboratorio se utiliza:
+
+```python
+producer.flush(10)
+```
+
+antes de devolver la respuesta.
+
+Esto permite validar que el lote fue enviado hacia Kafka antes de responder al cliente.
+
+> Este mecanismo deberá revisarse para pruebas de volumen y para un diseño productivo. El comportamiento de backpressure, acknowledgements parciales, reintentos y errores de streams largos todavía no está definido.
+
+---
+
+### 5.8 Cliente gRPC
+
+El cliente genera mensajes mediante un generador Python:
+
+```python
+def generar_personas():
+    ...
+    yield personas_pb2.CargaPersonaRequest(...)
+```
+
+El uso de `yield` permite entregar mensajes progresivamente al stream en vez de crear necesariamente todo el lote en memoria.
+
+La llamada gRPC se realiza mediante el Stub generado:
+
+```python
+stub = personas_pb2_grpc.PersonasServiceStub(channel)
+
+resultado = stub.EnviarPersonas(
+    generar_personas()
+)
+```
+
+En Docker el cliente se conecta mediante:
+
+```text
+grpc-server:50051
+```
+
+---
+
+### 5.9 Servicios Docker
+
+Servidor:
+
+```yaml
+grpc-server:
+  build:
+    context: ./apps/grpc
+    dockerfile: server/Dockerfile
+  container_name: bnh-grpc-server
+  hostname: grpc-server
+
+  depends_on:
+    kafka:
+      condition: service_healthy
+
+  ports:
+    - "50051:50051"
+
+  restart: "no"
+```
+
+Cliente:
+
+```yaml
+grpc-client:
+  build:
+    context: ./apps/grpc
+    dockerfile: client/Dockerfile
+  container_name: bnh-grpc-client
+
+  depends_on:
+    - grpc-server
+
+  restart: "no"
+```
+
+---
+
+### 5.10 Healthcheck de Kafka
+
+Durante la primera integración se detectó una condición de carrera:
+
+```text
+Kafka container started
+    ↓
+grpc-server started
+    ↓
+Kafka todavía no aceptaba conexiones
+    ↓
+Connection refused
+```
+
+`depends_on` con `service_started` garantiza que el contenedor haya arrancado, pero no que Kafka esté listo para aceptar conexiones.
+
+Se agregó un healthcheck:
+
+```yaml
+healthcheck:
+  test:
+    [
+      "CMD-SHELL",
+      "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 || exit 1",
+    ]
+  interval: 5s
+  timeout: 5s
+  retries: 12
+  start_period: 10s
+```
+
+Y el servidor gRPC utiliza:
+
+```yaml
+depends_on:
+  kafka:
+    condition: service_healthy
+```
+
+El arranque queda:
+
+```text
+Kafka inicia
+    ↓
+healthcheck OK
+    ↓
+Kafka Healthy
+    ↓
+grpc-server inicia
+```
+
+La prueba en frío confirmó:
+
+```text
+Container bnh-kafka       Healthy
+Container bnh-grpc-server Started
+```
+
+---
+
+### 5.11 Prueba gRPC aislada
+
+Primero se validó gRPC sin Kafka.
+
+El cliente envió:
+
+```text
+P501 - Lucia
+P502 - Mateo
+P503 - Camila
+```
+
+por un único stream.
+
+El servidor recibió individualmente:
+
+```text
+Recibida persona id=P501 nombre=Lucia jurisdiccion=ARG-B lote_id=L-GRPC-001
+Recibida persona id=P502 nombre=Mateo jurisdiccion=ARG-B lote_id=L-GRPC-001
+Recibida persona id=P503 nombre=Camila jurisdiccion=ARG-B lote_id=L-GRPC-001
+```
+
+El cliente recibió:
+
+```text
+lote_id=L-GRPC-001 cantidad_recibida=3 estado=RECIBIDO
+```
+
+Con esto se validó:
+
+```text
+grpc-client
+    ↓
+client streaming
+    ↓
+grpc-server
+    ↓
+ResultadoCarga
+```
+
+---
+
+### 5.12 Prueba end-to-end gRPC → Kafka
+
+Se dejó un consumer escuchando:
+
+```bash
+docker compose run --rm consumer
+```
+
+Luego se ejecutó:
+
+```bash
+docker compose run --rm grpc-client
+```
+
+El consumer recibió:
+
+```text
+key=ARG-B:P501 partition=2 offset=9
+persona={
+  'metadata': {
+    'jurisdiccion': 'ARG-B',
+    'dominio': 'persona',
+    'lote_id': 'L-GRPC-001'
+  },
+  'registro': {
+    'id': 'P501',
+    'nombre': 'Lucia'
+  }
+}
+```
+
+```text
+key=ARG-B:P502 partition=1 offset=12
+```
+
+```text
+key=ARG-B:P503 partition=1 offset=13
+```
+
+Con esto quedó validado:
+
+```text
+gRPC client
+     ↓
+gRPC server
+     ↓
+Kafka
+     ↓
+bnh.personas
+     ↓
+Consumer Python
+```
+
+Cada persona se publica como un mensaje Kafka independiente.
+
+---
+
+### 5.13 Estado de la etapa
+
+Validado:
+
+```text
+REST ─────┐
+          │
+gRPC ─────┼──→ Kafka
+          │
+NiFi ─────┘
+```
+
+La integración gRPC funciona utilizando:
+
+```text
+Protocol Buffers
+HTTP/2 / gRPC
+client streaming
+Python
+Kafka
+```
+
+El contrato gRPC y el contrato REST coexistirán como interfaces públicas de BNH.
+
+---
+
+### 5.14 Pruebas de volumen realizadas
+
+Antes de incorporar Flink se ejecutaron pruebas de carga sobre el canal gRPC.
+
+Se probaron los siguientes volúmenes:
+
+- 10 registros.
+- 1.000 registros.
+- 10.000 registros.
+- 100.000 registros.
+- 1.000.000 de registros.
+
+Para evitar distorsiones se eliminaron los logs por registro del servidor.
+
+Resultados observados en el laboratorio:
+
+```text
+10 registros
+duración: 0.019 s
+throughput aproximado: 513 registros/s
+
+1.000 registros
+duración: 0.043 s
+throughput aproximado: 23.300 registros/s
+
+10.000 registros
+duración: 0.341 s
+throughput aproximado: 29.360 registros/s
+
+100.000 registros
+duración: 3.164 s
+throughput aproximado: 31.600 registros/s
+
+1.000.000 registros
+duración: 33.504 s
+throughput aproximado: 29.850 registros/s
+```
+
+Estas mediciones corresponden exclusivamente al laboratorio local y no deben
+interpretarse como un benchmark productivo.
+
+El objetivo de estas pruebas fue verificar que el flujo gRPC → Kafka se mantuviera
+estable al aumentar el volumen antes de incorporar procesamiento con Flink.
+
+---
+
+## Etapa 6 — Capa Bronze con Apache Flink y Apache Ozone
+
+En esta etapa el laboratorio utiliza **Apache Flink 2.1.1** para procesar los
+eventos provenientes de Kafka y **Apache Ozone 2.2.1** como almacenamiento
+activo de la capa Bronze.
+
+El objetivo es validar:
+
+* escritura desde Flink hacia almacenamiento compatible con S3;
+* persistencia del envelope canónico `{metadata, registro}`;
+* conservación de registros `VALIDO` e `INVALIDO`;
+* checkpointing y finalización de archivos de `FileSink`;
+* acceso a Bronze desde clientes S3;
+* lectura posterior desde Apache Spark.
+
+La topología actual es:
+
+```text
+REST ──┐
+       │
+gRPC ──┼──> Kafka ──> PyFlink ──> Apache Ozone
+       │                              │
+NiFi ──┘                              └──> bnh-bronze
+                                        ├── personas/
+                                        └── organizaciones/
+```
+
+Las tres formas de ingesta ya fueron probadas hasta Bronze para Persona y
+Organización.
+
+---
+
+### 6.1 Componentes Ozone del laboratorio
+
+El laboratorio utiliza la imagen:
+
+```text
+apache/ozone:2.2.1-slim
+```
+
+Servicios:
+
+```text
+ozone-scm
+ozone-om
+ozone-datanode
+ozone-s3g
+ozone-init
+```
+
+Conceptualmente:
+
+```text
+                       ┌──────────────┐
+S3 client / Spark ───> │ S3 Gateway   │
+                       └──────┬───────┘
+                              │
+                              v
+                       ┌──────────────┐
+                       │ Ozone Manager│
+                       │     (OM)     │
+                       └──────┬───────┘
+                              │
+                              v
+                       ┌──────────────┐
+                       │     SCM      │
+                       └──────┬───────┘
+                              │
+                              v
+                       ┌──────────────┐
+                       │  DataNode    │
+                       └──────────────┘
+```
+
+Responsabilidades simplificadas:
+
+* **Ozone Manager (OM):** namespace y metadata lógica de volumes, buckets y keys.
+* **Storage Container Manager (SCM):** administración de bloques, pipelines y
+  DataNodes.
+* **DataNode:** almacenamiento físico de los bloques.
+* **S3 Gateway (S3G):** expone una API compatible con S3 para clientes externos.
+* **ozone-init:** inicialización idempotente del volume y bucket Bronze.
+
+---
+
+### 6.2 Configuración mínima del LAB
+
+El laboratorio utiliza un único DataNode y replicación `1`.
+
+Configuraciones relevantes:
+
+```text
+ozone.replication = 1
+hdds.scm.safemode.min.datanode = 1
+```
+
+Esto permite ejecutar Ozone en una PC/laptop con recursos limitados.
+
+> Esta configuración es exclusiva del laboratorio. Una topología productiva
+> debe definir cantidad de nodos, replicación, recursos, seguridad y estrategia
+> de recuperación según los requisitos reales.
+
+---
+
+### 6.3 Persistencia Ozone
+
+Los servicios utilizan volúmenes Docker separados:
+
+```text
+ozone_scm_data
+ozone_om_data
+ozone_datanode_data
+```
+
+Mientras no se ejecute:
+
+```bash
+docker compose down -v
+```
+
+el contenido debería mantenerse entre recreaciones de contenedores.
+
+---
+
+### 6.4 Bronze en Ozone
+
+El bucket S3 utilizado por BNH es:
+
+```text
+bnh-bronze
+```
+
+Dentro de Ozone corresponde actualmente a:
+
+```text
+/s3v/bnh-bronze
+```
+
+Layout:
+
+```text
+OBJECT_STORE
+```
+
+Estructura lógica utilizada:
+
+```text
+bnh-bronze/
+├── personas/
+└── organizaciones/
+```
+
+Las aplicaciones acceden mediante rutas:
+
+```text
+s3://bnh-bronze/personas/
+s3://bnh-bronze/organizaciones/
+```
+
+Spark utiliza el esquema:
+
+```text
+s3a://bnh-bronze/...
+```
+
+---
+
+### 6.5 Inicialización automática de Bronze
+
+El servicio:
+
+```text
+ozone-init
+```
+
+evita depender de una creación manual del bucket.
+
+Su responsabilidad es:
+
+1. esperar a que Ozone Manager responda;
+2. crear `/s3v` si no existe;
+3. crear `/s3v/bnh-bronze` si no existe;
+4. utilizar layout `OBJECT_STORE`;
+5. finalizar con exit code `0` si el bucket fue creado o ya existía.
+
+Ejecución manual:
+
+```bash
+docker compose up ozone-init
+```
+
+La idempotencia fue validada ejecutando el servicio dos veces consecutivas.
+Ambas ejecuciones finalizaron con código `0`.
+
+Para verificar directamente el bucket:
+
+```bash
+docker exec bnh-ozone-om \
+  ozone sh bucket info /s3v/bnh-bronze
+```
+
+Resultado esperado, entre otros campos:
+
+```text
+volumeName: s3v
+name: bnh-bronze
+bucketLayout: OBJECT_STORE
+```
+
+---
+
+### 6.6 Safe Mode de SCM
+
+Que OM y S3 Gateway respondan no implica necesariamente que Ozone ya pueda
+asignar bloques para escrituras.
+
+Después de un arranque en frío verificar:
+
+```bash
+docker exec bnh-ozone-scm \
+  ozone admin safemode wait -t 60
+```
+
+Esperado:
+
+```text
+SCM is out of safe mode.
+```
+
+Durante la configuración inicial, con un único DataNode, SCM permanecía en Safe
+Mode porque el mínimo de DataNodes no coincidía con la topología del LAB.
+
+Se fijó:
+
+```text
+hdds.scm.safemode.min.datanode = 1
+```
+
+No se utiliza una salida forzada de Safe Mode como solución permanente del
+laboratorio.
+
+---
+
+### 6.7 S3 Gateway
+
+Endpoint interno:
+
+```text
+http://ozone-s3g:9878
+```
+
+Endpoint desde el host:
+
+```text
+http://localhost:9878
+```
+
+Para pruebas S3 del laboratorio se utiliza AWS CLI en un contenedor descartable.
+
+Verificar que el bucket sea visible por S3 Gateway:
+
+```bash
+docker run --rm \
+  --network container:bnh-ozone-s3g \
+  -e AWS_ACCESS_KEY_ID=bnhadmin \
+  -e AWS_SECRET_ACCESS_KEY=bnh-lab-secret \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest \
+  s3api \
+  --endpoint-url http://localhost:9878 \
+  head-bucket \
+  --bucket bnh-bronze
+```
+
+`head-bucket` no imprime contenido cuando finaliza correctamente.
+
+Confirmar exit code:
+
+```bash
+echo $?
+```
+
+Esperado:
+
+```text
+0
+```
+
+---
+
+### 6.8 Listar Bronze por S3
+
+Personas:
+
+```bash
+docker run --rm \
+  --network container:bnh-ozone-s3g \
+  -e AWS_ACCESS_KEY_ID=bnhadmin \
+  -e AWS_SECRET_ACCESS_KEY=bnh-lab-secret \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest \
+  --endpoint-url http://localhost:9878 \
+  s3 ls s3://bnh-bronze/personas/ --recursive
+```
+
+Organizaciones:
+
+```bash
+docker run --rm \
+  --network container:bnh-ozone-s3g \
+  -e AWS_ACCESS_KEY_ID=bnhadmin \
+  -e AWS_SECRET_ACCESS_KEY=bnh-lab-secret \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest \
+  --endpoint-url http://localhost:9878 \
+  s3 ls s3://bnh-bronze/organizaciones/ --recursive
+```
+
+Para inspeccionar un objeto:
+
+```bash
+docker run --rm \
+  --network container:bnh-ozone-s3g \
+  -e AWS_ACCESS_KEY_ID=bnhadmin \
+  -e AWS_SECRET_ACCESS_KEY=bnh-lab-secret \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest \
+  --endpoint-url http://localhost:9878 \
+  s3 cp \
+  s3://bnh-bronze/personas/<RUTA_DEL_OBJETO> -
+```
+
+---
+
+### 6.9 Integración Flink con Ozone
+
+Flink utiliza:
+
+```text
+flink-s3-fs-hadoop-2.1.1.jar
+```
+
+habilitado en:
+
+```text
+/opt/flink/plugins/s3-fs-hadoop/
+```
+
+Tanto JobManager como TaskManager utilizan el endpoint:
+
+```text
+s3.endpoint: http://ozone-s3g:9878
+s3.path.style.access: true
+```
+
+Las credenciales configuradas en `compose.yaml` son exclusivamente de LAB.
+
+Los jobs no conocen la implementación física del storage. Continúan escribiendo:
+
+```text
+s3://bnh-bronze/personas/
+s3://bnh-bronze/organizaciones/
+```
+
+El cambio de backend queda encapsulado principalmente en la configuración S3 de
+Flink.
+
+---
+
+### 6.10 Smoke test Flink → Ozone
+
+Job:
+
+```text
+apps/flink/jobs/s3_smoke.py
+```
+
+Destino:
+
+```text
+s3://bnh-bronze/flink-smoke/
+```
+
+El objetivo del smoke es probar únicamente:
+
+```text
+PyFlink
+  ↓
+FileSink
+  ↓
+plugin S3
+  ↓
+S3 Gateway
+  ↓
+Apache Ozone
+```
+
+No valida reglas de Persona u Organización.
+
+---
+
+### 6.11 Jobs Bronze vigentes
+
+Persona:
+
+```text
+apps/flink/jobs/personas_validate.py
+```
+
+Topic:
+
+```text
+bnh.personas
+```
+
+Destino:
+
+```text
+s3://bnh-bronze/personas/
+```
+
+Organización:
+
+```text
+apps/flink/jobs/organizaciones_validate.py
+```
+
+Topic:
+
+```text
+bnh.organizaciones
+```
+
+Destino:
+
+```text
+s3://bnh-bronze/organizaciones/
+```
+
+Ambos jobs centralizan validaciones técnicas y producen:
+
+```json
+{
+  "estado_validacion": "VALIDO",
+  "errores": [],
+  "metadata": {
+    "jurisdiccion": "...",
+    "dominio": "...",
+    "lote_id": "..."
+  },
+  "registro": {
+    "...": "..."
+  }
+}
+```
+
+Los mensajes planos ya no forman parte del contrato vigente. Se requiere el
+envelope:
+
+```text
+{metadata, registro}
+```
+
+---
+
+### 6.12 Checkpointing y archivos temporales
+
+Los jobs habilitan checkpointing cada 5 segundos:
+
+```python
+env.enable_checkpointing(5000)
+```
+
+Con `FileSink`, durante una escritura puede aparecer:
+
+```text
+_part-..._tmp_...
+```
+
+Eso indica que el archivo todavía no fue finalizado.
+
+Después del rolling/checkpoint correspondiente debe aparecer:
+
+```text
+part-...
+```
+
+Para considerar una prueba Bronze cerrada se verifica el archivo `part-*`
+definitivo, no solamente el `_tmp_`.
+
+---
+
+### 6.13 Validación end-to-end REST → Ozone
+
+Ejemplo validado para Persona:
+
+```text
+lote_id = OZONE-REST-PER-001
+id_persona = OZONE-P000001
+```
+
+Recorrido:
+
+```text
+REST
+ ↓
+Kafka
+ ↓
+Flink
+ ↓
+Ozone Bronze
+```
+
+La API respondió:
+
+```json
+{
+  "status": "accepted",
+  "lote_id": "OZONE-REST-PER-001",
+  "cantidad_registros": 1
+}
+```
+
+Flink produjo:
+
+```text
+estado_validacion = VALIDO
+```
+
+y después del checkpoint quedó un archivo final:
+
+```text
+bnh-bronze/personas/<fecha-hora>/part-...
+```
+
+Para buscar un lote de Persona directamente en Bronze:
+
+```bash
+docker run --rm \
+  --network container:bnh-ozone-s3g \
+  -e AWS_ACCESS_KEY_ID=bnhadmin \
+  -e AWS_SECRET_ACCESS_KEY=bnh-lab-secret \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  --entrypoint /bin/sh \
+  amazon/aws-cli:latest -c '
+    aws --endpoint-url http://localhost:9878 \
+      s3 cp s3://bnh-bronze/personas/ /tmp/personas/ --recursive >/dev/null &&
+    grep -R "OZONE-REST-PER-001" /tmp/personas | grep -v "/_part-"
+  '
+```
+
+La misma prueba fue realizada para Organización:
+
+```text
+lote_id = OZONE-REST-ORG-001
+id_organizacion = OZONE-ORG-0001
+```
+
+con archivo final:
+
+```text
+bnh-bronze/organizaciones/<fecha-hora>/part-...
+```
+
+---
+
+### 6.14 Validación Ozone → Spark
+
+Antes de construir Processed se validó que Spark pudiera leer un objeto Bronze
+real mediante S3A.
+
+Recorrido:
+
+```text
+Apache Ozone
+    ↓
+S3 Gateway
+    ↓
+S3A
+    ↓
+Apache Spark
+```
+
+La lectura de prueba devolvió:
+
+```text
+TOTAL OZONE = 2
+```
+
+y Spark reconstruyó correctamente las estructuras:
+
+```text
+errores
+estado_validacion
+metadata
+registro
+```
+
+Esto confirmó que el almacenamiento Bronze generado por Flink puede ser
+consumido directamente por Spark.
+
+---
+
+### 6.15 Estado de la etapa Bronze
+
+Validado:
+
+```text
+REST ──┐
+       │
+gRPC ──┼──> Kafka ──> Flink ──> Ozone Bronze
+       │
+NiFi ──┘
+```
+
+Para Persona:
+
+```text
+REST → Bronze  ✅
+gRPC → Bronze  ✅
+NiFi → Bronze  ✅
+```
+
+Para Organización:
+
+```text
+REST → Bronze  ✅
+gRPC → Bronze  ✅
+NiFi → Bronze  ✅
+```
+
+También validado:
+
+* inicialización idempotente del bucket;
+* Safe Mode compatible con la topología mínima del LAB;
+* S3 Gateway;
+* escritura de objetos;
+* checkpointing de Flink;
+* finalización `_tmp_` → `part-*`;
+* lectura S3;
+* lectura Ozone → Spark.
+
+La etapa siguiente transforma Bronze hacia el schema `processed` del Data
+Warehouse.
+
+---
+---
+
+## Validación e integración de Persona hasta Bronze
+
+### Objetivo
+
+El laboratorio implementa y valida el flujo de ingestión de la entidad
+`Persona` hasta la capa Bronze.
+
+La arquitectura probada actualmente es:
+
+```text
+REST ──┐
+       │
+gRPC ──┼──> Kafka (`bnh.personas`) ──> PyFlink ──> Bronze (S3 compatible)
+       │
+NiFi ──┘
+```
+
+Estado actual:
+
+* REST → Kafka → Flink → Bronze: validado.
+* gRPC → Kafka → Flink → Bronze: validado.
+* NiFi → Kafka → Flink → Bronze: validado.
+* REST, gRPC y NiFi publican el envelope `{metadata, registro}` en `bnh.personas`.
+* Los tres canales producen el mismo registro canónico en Bronze.
+* `lote_id` es la única diferencia esperada.
+
+La validación funcional/técnica común de Persona se centraliza en Flink.
+Los canales de ingreso se encargan principalmente del transporte y de
+construir el envelope necesario.
+
+---
+
+### Modelo actual de Persona
+
+El registro normalizado contiene siempre los siguientes campos:
+
+```text
+id_persona
+fecha_nacimiento
+cuit
+c_documento
+nro_documento
+c_pais_nacimiento
+c_provincia_nacimiento
+c_departamento_nacimiento
+c_localidad_nacimiento
+c_municipio_nacimiento
+lugar_nacimiento
+c_fallecido
+fecha_fallecido
+c_es_indigena
+```
+
+Flink genera una representación canónica del registro:
+
+* todos los campos conocidos están siempre presentes;
+* los campos ausentes quedan como `null`;
+* los campos adicionales recibidos se conservan;
+* determinados identificadores/códigos numéricos se normalizan a `string`.
+
+Ejemplo:
+
+```json
+{
+  "estado_validacion": "VALIDO",
+  "errores": [],
+  "metadata": {
+    "jurisdiccion": "ARG-B",
+    "dominio": "persona",
+    "lote_id": "REST-CANON-001"
+  },
+  "registro": {
+    "id_persona": "P000001",
+    "fecha_nacimiento": "1990-05-10",
+    "cuit": "20123456789",
+    "c_documento": "DNI",
+    "nro_documento": "12345678",
+    "c_pais_nacimiento": "ARG",
+    "c_provincia_nacimiento": "B",
+    "c_departamento_nacimiento": "001",
+    "c_localidad_nacimiento": "001",
+    "c_municipio_nacimiento": "001",
+    "lugar_nacimiento": "Buenos Aires",
+    "c_fallecido": "N",
+    "fecha_fallecido": null,
+    "c_es_indigena": "N"
+  }
+}
+```
+
+---
+
+### Responsabilidades por componente
+
+#### REST / gRPC
+
+Los canales de entrada:
+
+* reciben el registro;
+* conservan metadata;
+* construyen el envelope;
+* publican en Kafka;
+* generan la key Kafka a partir de `jurisdiccion:id_persona`.
+
+No duplican las reglas de validación implementadas en Flink.
+
+Por ejemplo, un CUIT inválido como:
+
+```text
+2012345678A
+```
+
+puede ser aceptado por REST/gRPC y transportado a Kafka.
+
+Flink es quien posteriormente lo clasifica como `INVALIDO`.
+
+#### Kafka
+
+Kafka funciona como capa de transporte y desacoplamiento.
+
+Topic actual:
+
+```text
+bnh.personas
+```
+
+El laboratorio utiliza 3 particiones y replication factor 1.
+
+Kafka no aplica reglas de validación de Persona.
+
+#### Flink
+
+Flink centraliza:
+
+* parsing;
+* validación estructural;
+* normalización;
+* canonicalización;
+* validaciones técnicas de Persona;
+* generación de `estado_validacion`;
+* generación de errores;
+* persistencia hacia Bronze.
+
+Job:
+
+```text
+BNH - Personas Normalize Validate and Bronze
+```
+
+Archivo:
+
+```text
+apps/flink/jobs/personas_validate.py
+```
+
+#### Bronze
+
+Los resultados procesados por Flink se persisten actualmente en:
+
+```text
+s3://bnh-bronze/personas/
+```
+
+La implementación utiliza `FileSink`.
+
+Durante una escritura pueden aparecer archivos temporales:
+
+```text
+_part-..._tmp_...
+```
+
+Cuando ocurre el rolling del archivo y el checkpoint correspondiente,
+el objeto pasa a un archivo final:
+
+```text
+part-...
+```
+
+Esto es comportamiento normal del FileSink.
+
+---
+
+## Casos sintéticos de Persona
+
+Los datos reutilizables están en:
+
+```text
+scripts/testdata/personas.py
+```
+
+Casos disponibles:
+
+```text
+valid
+missing-id
+missing-birth-date
+missing-document-type
+missing-country
+missing-indigenous
+numeric-identifiers
+numeric-country-code
+numeric-codes
+invalid-birth-date
+invalid-death-date
+invalid-cuit-length
+invalid-cuit-nondigit
+invalid-root
+invalid-envelope
+invalid-flat
+invalid-place-type
+```
+
+También existe un smoke check rápido:
+
+```text
+scripts/testdata/check_personas.py
+```
+
+Ejecutar:
+
+```bash
+python3 scripts/testdata/check_personas.py
+```
+
+Actualmente cubre 17 casos.
+
+Este script permite revisar rápidamente la lógica Python, pero la evidencia
+principal del laboratorio continúa siendo el flujo real:
+
+```text
+canal → Kafka → Flink → Bronze
+```
+
+---
+
+## Levantar el flujo Persona
+
+Ejecutar desde la raíz del repositorio.
+
+### Infraestructura mínima
+
+Para una sesión normal puede levantarse todo el laboratorio:
+
+```bash
+docker compose up -d
+```
+
+Si se desea levantar únicamente el tramo necesario hasta Bronze:
+
+```bash
+docker compose up -d \
+  kafka \
+  ozone-scm \
+  ozone-om \
+  ozone-datanode \
+  ozone-s3g \
+  ozone-init \
+  flink-jobmanager \
+  flink-taskmanager
+```
+
+Antes de enviar datos, esperar que SCM pueda asignar bloques:
+
+```bash
+docker exec bnh-ozone-scm \
+  ozone admin safemode wait -t 60
+```
+
+### Crear el topic Kafka
+
+En un entorno nuevo:
+
+```bash
+docker exec bnh-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --create \
+  --if-not-exists \
+  --topic bnh.personas \
+  --partitions 3 \
+  --replication-factor 1
+```
+
+> La creación automática del topic todavía no está implementada.
+
+### Ejecutar el job de Flink
+
+```bash
+docker exec bnh-flink-jobmanager \
+  flink run -d \
+  -py /opt/flink/jobs/personas_validate.py
+```
+
+Verificar:
+
+```bash
+curl -s http://localhost:8081/jobs/overview
+```
+
+Debe existir un job:
+
+```text
+BNH - Personas Normalize Validate and Bronze
+```
+
+en estado:
+
+```text
+RUNNING
+```
+
+---
+
+## Validar REST
+
+Construir y levantar:
+
+```bash
+docker compose build api
+docker compose up -d api
+```
+
+Health check:
+
+```bash
+curl -s http://localhost:8000/health
+```
+
+### Persona válida
+
+```bash
+python3 scripts/testdata/personas.py --case valid \
+  | python3 -c '
+import sys,json
+data=json.load(sys.stdin)
+data["metadata"]["lote_id"]="REST-VALID-001"
+print(json.dumps(data, ensure_ascii=False))
+' \
+  | curl -s -w '\nHTTP %{http_code}\n' \
+      -X POST http://localhost:8000/personas \
+      -H "Content-Type: application/json" \
+      -d @-
+```
+
+Esperado:
+
+```text
+HTTP 202
+```
+
+y posteriormente Flink:
+
+```text
+estado_validacion = VALIDO
+```
+
+### Persona con CUIT inválido
+
+```bash
+python3 scripts/testdata/personas.py --case invalid-cuit-nondigit \
+  | python3 -c '
+import sys,json
+data=json.load(sys.stdin)
+data["metadata"]["lote_id"]="REST-INVALID-CUIT-001"
+print(json.dumps(data, ensure_ascii=False))
+' \
+  | curl -s -w '\nHTTP %{http_code}\n' \
+      -X POST http://localhost:8000/personas \
+      -H "Content-Type: application/json" \
+      -d @-
+```
+
+REST debe aceptar el registro (`HTTP 202`).
+
+Flink debe generar:
+
+```text
+estado_validacion = INVALIDO
+registro.cuit debe contener solo digitos
+```
+
+---
+
+## Validar gRPC
+
+Construir:
+
+```bash
+docker compose build grpc-server grpc-client
+docker compose up -d grpc-server
+```
+
+### Persona válida
+
+```bash
+TOTAL_PERSONAS=1 \
+GRPC_CASE=valid \
+LOTE_ID=GRPC-VALID-001 \
+docker compose run --rm grpc-client
+```
+
+### CUIT inválido
+
+```bash
+TOTAL_PERSONAS=1 \
+GRPC_CASE=invalid-cuit \
+LOTE_ID=GRPC-INVALID-CUIT-001 \
+docker compose run --rm grpc-client
+```
+
+gRPC debe aceptar ambos registros.
+
+Flink debe producir respectivamente:
+
+```text
+GRPC-VALID-001
+→ VALIDO
+```
+
+y:
+
+```text
+GRPC-INVALID-CUIT-001
+→ INVALIDO
+→ registro.cuit debe contener solo digitos
+```
+
+---
+
+## Verificar Flink
+
+Buscar ejecuciones por lote:
+
+```bash
+docker logs --tail 1000 bnh-flink-taskmanager 2>&1 \
+  | grep -E 'REST-VALID-001|REST-INVALID-CUIT-001|GRPC-VALID-001|GRPC-INVALID-CUIT-001|NIFI-VALID-001|NIFI-INVALID-CUIT-001'
+```
+
+---
+
+## Verificar Bronze
+
+Listar objetos de Persona mediante S3 Gateway:
+
+```bash
+docker run --rm \
+  --network container:bnh-ozone-s3g \
+  -e AWS_ACCESS_KEY_ID=bnhadmin \
+  -e AWS_SECRET_ACCESS_KEY=bnh-lab-secret \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest \
+  --endpoint-url http://localhost:9878 \
+  s3 ls s3://bnh-bronze/personas/ --recursive
+```
+
+Para inspeccionar un objeto:
+
+```bash
+docker run --rm \
+  --network container:bnh-ozone-s3g \
+  -e AWS_ACCESS_KEY_ID=bnhadmin \
+  -e AWS_SECRET_ACCESS_KEY=bnh-lab-secret \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest \
+  --endpoint-url http://localhost:9878 \
+  s3 cp s3://bnh-bronze/personas/<RUTA_DEL_OBJETO> -
+```
+
+Para considerar la escritura finalizada, usar archivos:
+
+```text
+part-...
+```
+
+y no los temporales:
+
+```text
+_part-..._tmp_...
+```
+
+---
+
+## Validar NiFi
+
+El flujo vigente está versionado en:
+
+```text
+nifi/flows/BNH_-_Personas_File_Ingestion.json
+```
+
+Pipeline:
+
+```text
+GetFile
+  → SplitRecord
+  → JoltTransformJSON
+  → EvaluateJsonPath
+  → PublishKafka
+failure → LogErrors
+```
+
+CSVReader usa `Use String Fields From Header` (`csv-header-derived`).
+Todos los campos se leen como string. No se usa inferencia automática de
+tipos, para preservar códigos con ceros a la izquierda (`001` permanece
+`"001"`).
+
+`JoltTransformJSON` convierte cada fila en el envelope común:
+
+```json
+{
+  "metadata": {
+    "jurisdiccion": "...",
+    "dominio": "...",
+    "lote_id": "..."
+  },
+  "registro": {
+    "...": "..."
+  }
+}
+```
+
+Kafka key:
+
+```text
+${persona.jurisdiccion}:${persona.id}
+```
+
+equivalente a `jurisdiccion:id_persona`.
+
+NiFi no duplica las validaciones de Persona: un CUIT inválido se publica
+igual que en REST/gRPC y Flink lo clasifica.
+
+### Importar el flujo
+
+Levantar NiFi:
+
+```bash
+docker compose up -d kafka nifi
+```
+
+Cuando `https://localhost:8443/nifi` responda:
+
+```bash
+python3 scripts/nifi/import_personas_flow.py
+```
+
+El script elimina un grupo previo con el mismo nombre, importa el JSON,
+habilita los Controller Services e inicia los procesadores.
+
+### Archivos de prueba
+
+```text
+scripts/testdata/nifi/NIFI-VALID-001.csv
+scripts/testdata/nifi/NIFI-INVALID-CUIT-001.csv
+scripts/testdata/nifi/NIFI-CANON-001.csv
+```
+
+Se pueden regenerar:
+
+```bash
+python3 scripts/testdata/personas.py --case valid --format csv --lote-id NIFI-VALID-001
+python3 scripts/testdata/personas.py --case invalid-cuit-nondigit --format csv --lote-id NIFI-INVALID-CUIT-001
+```
+
+Los campos opcionales vacíos se omiten en el CSV. Flink completa los
+campos conocidos faltantes como `null`.
+
+### Persona válida
+
+```bash
+cp scripts/testdata/nifi/NIFI-VALID-001.csv data/incoming/personas/
+```
+
+GetFile consulta la landing cada 5 segundos y elimina el archivo al
+incorporarlo (`Keep Source File = false`).
+
+Flink debe generar:
+
+```text
+estado_validacion = VALIDO
+```
+
+y conservar códigos como `"001"`.
+
+### CUIT inválido
+
+```bash
+cp scripts/testdata/nifi/NIFI-INVALID-CUIT-001.csv data/incoming/personas/
+```
+
+NiFi debe aceptar y publicar el mensaje.
+
+Flink debe generar:
+
+```text
+estado_validacion = INVALIDO
+registro.cuit debe contener solo digitos
+```
+
+---
+
+## Convergencia REST / gRPC / NiFi
+
+Los tres canales, enviando la misma Persona, deben generar en Bronze:
+
+* el mismo `registro`;
+* el mismo `estado_validacion`;
+* los mismos `errores`;
+* la misma metadata común.
+
+El comparador ignora únicamente `lote_id`.
+
+```bash
+python3 scripts/testdata/personas.py --case valid \
+  | python3 -c '
+import sys,json
+data=json.load(sys.stdin)
+data["metadata"]["lote_id"]="REST-CANON-001"
+print(json.dumps(data, ensure_ascii=False))
+' \
+  | curl -s -w '\nHTTP %{http_code}\n' \
+      -X POST http://localhost:8000/personas \
+      -H "Content-Type: application/json" \
+      -d @-
+
+TOTAL_PERSONAS=1 \
+GRPC_CASE=valid \
+LOTE_ID=GRPC-CANON-001 \
+docker compose run --rm grpc-client
+
+cp scripts/testdata/nifi/NIFI-CANON-001.csv data/incoming/personas/
+```
+
+Dump de Bronze (archivos `part-*`, sin `_tmp_`) y comparación:
+
+```bash
+python3 scripts/testdata/compare_bronze_personas.py \
+  /ruta/al/dump-bronze.jsonl \
+  --lotes REST-CANON-001 GRPC-CANON-001 NIFI-CANON-001
+```
+
+Se comprobó en el laboratorio que los tres lotes de una Persona convergen.
+
+---
+
+## Múltiples Personas por lote
+
+REST ya acepta `registros` en un único POST.
+gRPC ya envía un stream con `TOTAL_PERSONAS`.
+NiFi ya parte un CSV en un FlowFile por fila (`SplitRecord`, 1 registro).
+
+Lotes de cierre:
+
+```text
+REST-MULTI-001
+GRPC-MULTI-001
+NIFI-MULTI-001
+```
+
+Tres Personas: `P000001`, `P000002`, `P000003`. Todas válidas. Los códigos
+`001` van en las tres.
+
+### REST
+
+```bash
+python3 scripts/testdata/personas.py --case valid --lote-id REST-MULTI-001 --count 3 \
+  | curl -s -w '\nHTTP %{http_code}\n' \
+      -X POST http://localhost:8000/personas \
+      -H "Content-Type: application/json" \
+      -d @-
+```
+
+Esperado: `HTTP 202` y `cantidad_registros: 3`.
+
+### gRPC
+
+```bash
+TOTAL_PERSONAS=3 \
+GRPC_CASE=valid \
+LOTE_ID=GRPC-MULTI-001 \
+docker compose run --rm grpc-client
+```
+
+Esperado: `cantidad_recibida=3`.
+
+### NiFi
+
+```bash
+cp scripts/testdata/nifi/NIFI-MULTI-001.csv data/incoming/personas/
+```
+
+El CSV tiene 1 header y 3 filas. NiFi debe publicar 3 mensajes.
+
+Kafka key esperada por Persona:
+
+```text
+ARG-B:P000001
+ARG-B:P000002
+ARG-B:P000003
+```
+
+Comparar Bronze, Persona por Persona:
+
+```bash
+python3 scripts/testdata/compare_bronze_personas.py \
+  /ruta/al/dump-bronze.jsonl \
+  --lotes REST-MULTI-001 GRPC-MULTI-001 NIFI-MULTI-001 \
+  --esperadas 3
+```
+
+El comparador agrupa por `lote_id` + `id_persona`. Compara `registro`,
+`estado_validacion`, `errores` y metadata común, ignorando únicamente
+`lote_id`. Detecta faltantes, extras, duplicados y diferencias de contenido.
+
+Los tres canales de Persona publican `{metadata, registro}`. La
+compatibilidad de Flink con payload plano se eliminó. Un mensaje plano
+queda `INVALIDO` con:
+
+```text
+se requiere envelope {metadata, registro}
+```
+
+El productor histórico `apps/producer/producer.py` sigue siendo el smoke
+de etapas iniciales y no forma parte del contrato de Persona.
+
+---
+
+## Reglas deliberadamente fuera de alcance actual
+
+Todavía no se implementan como validaciones duras:
+
+* dígito verificador de CUIT;
+* DNI → CUIT obligatorio;
+* DNI → número de documento únicamente numérico;
+* estados "En trámite" / "No Posee";
+* validación contra catálogos oficiales;
+* país/provincia/departamento/localidad/municipio;
+* dependencia geográfica entre códigos;
+* provincia obligatoria para Argentina;
+* lugar de nacimiento obligatorio para extranjeros;
+* relación `c_fallecido` / `fecha_fallecido`;
+* edad mínima/máxima;
+* fechas futuras;
+* relación nacimiento/fallecimiento;
+* movimientos posteriores al fallecimiento;
+* integración RENAPER / SINTyS / ANSES.
+
+Estas reglas requieren definiciones funcionales o catálogos oficiales y no se
+consideran confirmadas únicamente por aparecer en relevamientos/documentación.
+
+---
+---
+
+## Validación e integración de Organización hasta Bronze
+
+### Objetivo
+
+El laboratorio implementa y valida el flujo de ingestión de la entidad
+`Organizacion` hasta la capa Bronze, siguiendo el mismo patrón ya validado
+para Persona.
+
+El mapa de trabajo de esta etapa es el DER v0.4. No se intentó resolver
+integraciones con padrón ni otras fuentes externas.
+
+La arquitectura probada es:
+
+```text
+REST ──┐
+       │
+gRPC ──┼──> Kafka (`bnh.organizaciones`) ──> PyFlink ──> Bronze (S3 compatible)
+       │
+NiFi ──┘
+```
+
+Estado actual:
+
+* REST → Kafka → Flink → Bronze: validado.
+* gRPC → Kafka → Flink → Bronze: validado.
+* NiFi → Kafka → Flink → Bronze: validado.
+* REST, gRPC y NiFi publican el envelope `{metadata, registro}` en `bnh.organizaciones`.
+* Los tres canales producen el mismo registro canónico en Bronze.
+* `lote_id` es la única diferencia esperada.
+
+La validación técnica común de Organización se centraliza en Flink.
+Los canales de ingreso se encargan del transporte y de construir el envelope.
+
+El alcance de esta etapa termina en Bronze.
+
+---
+
+### Modelo actual de Organización
+
+El registro normalizado contiene siempre los siguientes campos conocidos:
+
+```text
+id_organizacion
+nombre
+descripcion
+c_organizacion
+fecha_alta
+fecha_baja
+```
+
+Obligatorios:
+
+```text
+id_organizacion
+nombre
+c_organizacion
+fecha_alta
+```
+
+Opcionales:
+
+```text
+descripcion
+fecha_baja
+```
+
+Flink genera una representación canónica del registro:
+
+* los 6 campos conocidos están siempre presentes;
+* los campos opcionales ausentes quedan como `null`;
+* los campos adicionales recibidos se conservan;
+* `id_organizacion` y `c_organizacion` numéricos se normalizan a `string`
+  (`bool` no se trata como `int`).
+
+Ejemplo:
+
+```json
+{
+  "estado_validacion": "VALIDO",
+  "errores": [],
+  "metadata": {
+    "jurisdiccion": "ARG-B",
+    "dominio": "organizacion",
+    "lote_id": "REST-ORG-CANON-001"
+  },
+  "registro": {
+    "id_organizacion": "ORG000001",
+    "nombre": "Hospital Central",
+    "descripcion": "Organizacion de prueba del laboratorio",
+    "c_organizacion": "01",
+    "fecha_alta": "2020-01-15",
+    "fecha_baja": null
+  }
+}
+```
+
+---
+
+### Responsabilidades por componente
+
+#### REST / gRPC
+
+Los canales de entrada:
+
+* reciben el registro;
+* conservan metadata;
+* construyen el envelope;
+* publican en Kafka;
+* generan la key Kafka a partir de `jurisdiccion:id_organizacion`.
+
+No duplican las reglas de validación implementadas en Flink.
+
+Por ejemplo, una `fecha_alta` inválida como:
+
+```text
+2020-99-99
+```
+
+puede ser aceptada por REST/gRPC y transportada a Kafka.
+
+Flink es quien posteriormente la clasifica como `INVALIDO`.
+
+REST acepta un registro:
+
+```json
+{
+  "metadata": { "...": "..." },
+  "registro": { "...": "..." }
+}
+```
+
+o un lote:
+
+```json
+{
+  "metadata": { "...": "..." },
+  "registros": [ { "...": "..." } ]
+}
+```
+
+Cada Organización se publica como un mensaje Kafka independiente.
+
+gRPC usa client streaming. El contrato de Persona no cambia. Organización
+expone un servicio propio en el mismo servidor:
+
+```text
+OrganizacionesService.EnviarOrganizaciones
+```
+
+#### Kafka
+
+Topic:
+
+```text
+bnh.organizaciones
+```
+
+El laboratorio utiliza 3 particiones y replication factor 1.
+
+Kafka key:
+
+```text
+jurisdiccion:id_organizacion
+```
+
+ejemplo:
+
+```text
+ARG-B:ORG000001
+```
+
+Kafka no aplica reglas de validación de Organización.
+
+#### Flink
+
+Flink centraliza parsing, validación estructural, normalización,
+canonicalización, validaciones técnicas, `estado_validacion`, errores y
+persistencia hacia Bronze.
+
+Job:
+
+```text
+BNH - Organizaciones Normalize Validate and Bronze
+```
+
+Archivo:
+
+```text
+apps/flink/jobs/organizaciones_validate.py
+```
+
+Es un job específico. No se convirtió `personas_validate.py` en un
+framework genérico.
+
+Si Persona y Organización corren al mismo tiempo, el TaskManager del
+laboratorio ya tiene 2 task slots.
+
+#### Bronze
+
+```text
+s3://bnh-bronze/organizaciones/
+```
+
+Durante una escritura pueden aparecer archivos temporales `_tmp_`.
+Eso es comportamiento normal del FileSink.
+
+---
+
+## Casos sintéticos de Organización
+
+```text
+scripts/testdata/organizaciones.py
+```
+
+Casos disponibles:
+
+```text
+valid
+missing-id
+missing-name
+missing-type
+missing-start-date
+numeric-identifiers
+numeric-type-code
+invalid-start-date
+invalid-end-date
+invalid-name-type
+invalid-description-type
+invalid-root
+invalid-envelope
+invalid-flat
+```
+
+Smoke check:
+
+```bash
+python3 scripts/testdata/check_organizaciones.py
+```
+
+Actualmente cubre 14 casos.
+
+La evidencia principal del laboratorio continúa siendo el flujo real:
+
+```text
+canal → Kafka → Flink → Bronze
+```
+
+---
+
+## Levantar el flujo Organización
+
+Ejecutar desde la raíz del repositorio.
+
+Persona puede seguir corriendo en paralelo. No es necesario detenerla.
+
+### Infraestructura mínima
+
+Para una sesión normal puede levantarse todo el laboratorio:
+
+```bash
+docker compose up -d
+```
+
+Si se desea levantar únicamente el tramo necesario hasta Bronze:
+
+```bash
+docker compose up -d \
+  kafka \
+  ozone-scm \
+  ozone-om \
+  ozone-datanode \
+  ozone-s3g \
+  ozone-init \
+  flink-jobmanager \
+  flink-taskmanager
+```
+
+Antes de enviar datos, esperar que SCM pueda asignar bloques:
+
+```bash
+docker exec bnh-ozone-scm \
+  ozone admin safemode wait -t 60
+```
+
+### Crear el topic Kafka
+
+```bash
+docker exec bnh-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --create \
+  --if-not-exists \
+  --topic bnh.organizaciones \
+  --partitions 3 \
+  --replication-factor 1
+```
+
+### Ejecutar el job de Flink
+
+```bash
+docker exec bnh-flink-jobmanager \
+  flink run -d \
+  -py /opt/flink/jobs/organizaciones_validate.py
+```
+
+Verificar:
+
+```bash
+curl -s http://localhost:8081/jobs/overview
+```
+
+Debe existir un job:
+
+```text
+BNH - Organizaciones Normalize Validate and Bronze
+```
+
+en estado:
+
+```text
+RUNNING
+```
+
+---
+
+## Validar REST
+
+```bash
+docker compose build api
+docker compose up -d api
+```
+
+### Organización válida
+
+```bash
+python3 scripts/testdata/organizaciones.py --case valid \
+  --lote-id REST-ORG-VALID-001 \
+  | curl -s -w '\nHTTP %{http_code}\n' \
+      -X POST http://localhost:8000/organizaciones \
+      -H "Content-Type: application/json" \
+      -d @-
+```
+
+Esperado:
+
+```text
+HTTP 202
+```
+
+y posteriormente Flink:
+
+```text
+estado_validacion = VALIDO
+```
+
+### Organización con fecha_alta inválida
+
+```bash
+python3 scripts/testdata/organizaciones.py --case invalid-start-date \
+  --lote-id REST-ORG-INVALID-001 \
+  | curl -s -w '\nHTTP %{http_code}\n' \
+      -X POST http://localhost:8000/organizaciones \
+      -H "Content-Type: application/json" \
+      -d @-
+```
+
+REST debe aceptar el registro (`HTTP 202`).
+
+Flink debe generar:
+
+```text
+estado_validacion = INVALIDO
+registro.fecha_alta invalida
+```
+
+---
+
+## Validar gRPC
+
+El contrato se genera con el mismo procedimiento que Persona:
+
+```bash
+docker run --rm \
+  -v "$PWD:/workspace" \
+  -w /workspace \
+  python:3.12-slim \
+  sh -c "pip install --no-cache-dir grpcio-tools==1.83.0 && \
+  python -m grpc_tools.protoc \
+    -I contracts/grpc \
+    --python_out=apps/grpc/generated \
+    --grpc_python_out=apps/grpc/generated \
+    contracts/grpc/organizaciones/v1/organizaciones.proto"
+```
+
+```bash
+docker compose build grpc-server grpc-client
+docker compose up -d grpc-server
+```
+
+### Organización válida
+
+```bash
+TOTAL_ORGANIZACIONES=1 \
+GRPC_CASE=valid \
+LOTE_ID=GRPC-ORG-VALID-001 \
+docker compose run --rm grpc-client python organizaciones_client.py
+```
+
+### fecha_alta inválida
+
+```bash
+TOTAL_ORGANIZACIONES=1 \
+GRPC_CASE=invalid-start-date \
+LOTE_ID=GRPC-ORG-INVALID-001 \
+docker compose run --rm grpc-client python organizaciones_client.py
+```
+
+gRPC debe aceptar ambos registros.
+
+Flink debe producir respectivamente:
+
+```text
+GRPC-ORG-VALID-001
+→ VALIDO
+```
+
+y:
+
+```text
+GRPC-ORG-INVALID-001
+→ INVALIDO
+→ registro.fecha_alta invalida
+```
+
+El cliente de Persona (`client.py` / `TOTAL_PERSONAS`) no cambia.
+
+---
+
+## Verificar Flink
+
+```bash
+docker logs --tail 1000 bnh-flink-taskmanager 2>&1 \
+  | grep -E 'REST-ORG-|GRPC-ORG-|NIFI-ORG-'
+```
+
+---
+
+## Verificar Bronze
+
+```bash
+docker run --rm \
+  --network container:bnh-ozone-s3g \
+  -e AWS_ACCESS_KEY_ID=bnhadmin \
+  -e AWS_SECRET_ACCESS_KEY=bnh-lab-secret \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest \
+  --endpoint-url http://localhost:9878 \
+  s3 ls s3://bnh-bronze/organizaciones/ --recursive
+```
+
+Para inspeccionar un objeto:
+
+```bash
+docker run --rm \
+  --network container:bnh-ozone-s3g \
+  -e AWS_ACCESS_KEY_ID=bnhadmin \
+  -e AWS_SECRET_ACCESS_KEY=bnh-lab-secret \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:latest \
+  --endpoint-url http://localhost:9878 \
+  s3 cp s3://bnh-bronze/organizaciones/<RUTA_DEL_OBJETO> -
+```
+
+---
+
+## Validar NiFi
+
+El flujo está versionado en:
+
+```text
+nifi/flows/BNH_-_Organizaciones_File_Ingestion.json
+```
+
+Pipeline:
+
+```text
+GetFile
+  → SplitRecord
+  → JoltTransformJSON
+  → EvaluateJsonPath
+  → PublishKafka
+failure → LogErrors
+```
+
+Landing:
+
+```text
+data/incoming/organizaciones/
+```
+
+CSVReader usa `Use String Fields From Header` (`csv-header-derived`).
+Todos los campos se leen como string. No se usa inferencia automática de
+tipos.
+
+`JoltTransformJSON` convierte cada fila en el envelope común
+`{metadata, registro}`.
+
+EvaluateJsonPath:
+
+```text
+organizacion.jurisdiccion = $.metadata.jurisdiccion
+organizacion.id           = $.registro.id_organizacion
+```
+
+Kafka key:
+
+```text
+${organizacion.jurisdiccion}:${organizacion.id}
+```
+
+NiFi no duplica las validaciones de Organización.
+
+### Importar el flujo
+
+```bash
+docker compose up -d kafka nifi
+```
+
+Cuando `https://localhost:8443/nifi` responda:
+
+```bash
+python3 scripts/nifi/import_organizaciones_flow.py
+```
+
+El script elimina un grupo previo con el mismo nombre, importa el JSON,
+habilita los Controller Services e inicia los procesadores.
+
+El importador usa TLS inseguro únicamente porque NiFi del laboratorio
+expone un certificado autofirmado. Eso no es una definición productiva.
+
+El importador de Persona no se modificó.
+
+### Archivos de prueba
+
+```text
+scripts/testdata/nifi/NIFI-ORG-VALID-001.csv
+scripts/testdata/nifi/NIFI-ORG-INVALID-001.csv
+scripts/testdata/nifi/NIFI-ORG-CANON-001.csv
+scripts/testdata/nifi/NIFI-ORG-MULTI-001.csv
+```
+
+Se pueden regenerar:
+
+```bash
+python3 scripts/testdata/organizaciones.py --case valid --format csv --lote-id NIFI-ORG-VALID-001
+python3 scripts/testdata/organizaciones.py --case invalid-start-date --format csv --lote-id NIFI-ORG-INVALID-001
+python3 scripts/testdata/organizaciones.py --case valid --format csv --lote-id NIFI-ORG-CANON-001
+python3 scripts/testdata/organizaciones.py --case valid --format csv --lote-id NIFI-ORG-MULTI-001 --count 3
+```
+
+Los campos opcionales vacíos se omiten en el CSV. Flink completa los
+campos conocidos faltantes como `null`.
+
+### Organización válida
+
+```bash
+cp scripts/testdata/nifi/NIFI-ORG-VALID-001.csv data/incoming/organizaciones/
+```
+
+Flink debe generar:
+
+```text
+estado_validacion = VALIDO
+```
+
+### fecha_alta inválida
+
+```bash
+cp scripts/testdata/nifi/NIFI-ORG-INVALID-001.csv data/incoming/organizaciones/
+```
+
+NiFi debe aceptar y publicar el mensaje.
+
+Flink debe generar:
+
+```text
+estado_validacion = INVALIDO
+registro.fecha_alta invalida
+```
+
+---
+
+## Convergencia REST / gRPC / NiFi
+
+Los tres canales, enviando la misma Organización, deben generar en Bronze:
+
+* el mismo `registro`;
+* el mismo `estado_validacion`;
+* los mismos `errores`;
+* la misma metadata común.
+
+El comparador ignora únicamente `lote_id`. Indexa `lote_id` → `id_organizacion`.
+
+```bash
+python3 scripts/testdata/organizaciones.py --case valid --lote-id REST-ORG-CANON-001 \
+  | curl -s -w '\nHTTP %{http_code}\n' \
+      -X POST http://localhost:8000/organizaciones \
+      -H "Content-Type: application/json" \
+      -d @-
+
+TOTAL_ORGANIZACIONES=1 \
+GRPC_CASE=valid \
+LOTE_ID=GRPC-ORG-CANON-001 \
+docker compose run --rm grpc-client python organizaciones_client.py
+
+cp scripts/testdata/nifi/NIFI-ORG-CANON-001.csv data/incoming/organizaciones/
+```
+
+```bash
+python3 scripts/testdata/compare_bronze_organizaciones.py \
+  /ruta/al/dump-bronze.jsonl \
+  --lotes REST-ORG-CANON-001 GRPC-ORG-CANON-001 NIFI-ORG-CANON-001
+```
+
+Se comprobó en el laboratorio que los tres lotes de una Organización convergen.
+
+---
+
+## Múltiples Organizaciones por lote
+
+Lotes de cierre:
+
+```text
+REST-ORG-MULTI-001
+GRPC-ORG-MULTI-001
+NIFI-ORG-MULTI-001
+```
+
+Tres Organizaciones: `ORG000001`, `ORG000002`, `ORG000003`. Todas válidas.
+
+### REST
+
+```bash
+python3 scripts/testdata/organizaciones.py --case valid --lote-id REST-ORG-MULTI-001 --count 3 \
+  | curl -s -w '\nHTTP %{http_code}\n' \
+      -X POST http://localhost:8000/organizaciones \
+      -H "Content-Type: application/json" \
+      -d @-
+```
+
+Esperado: `HTTP 202` y `cantidad_registros: 3`.
+
+### gRPC
+
+```bash
+TOTAL_ORGANIZACIONES=3 \
+GRPC_CASE=valid \
+LOTE_ID=GRPC-ORG-MULTI-001 \
+docker compose run --rm grpc-client python organizaciones_client.py
+```
+
+Esperado: `cantidad_recibida=3`.
+
+### NiFi
+
+```bash
+cp scripts/testdata/nifi/NIFI-ORG-MULTI-001.csv data/incoming/organizaciones/
+```
+
+El CSV tiene 1 header y 3 filas. NiFi debe publicar 3 mensajes.
+
+Kafka key esperada por Organización:
+
+```text
+ARG-B:ORG000001
+ARG-B:ORG000002
+ARG-B:ORG000003
+```
+
+```bash
+python3 scripts/testdata/compare_bronze_organizaciones.py \
+  /ruta/al/dump-bronze.jsonl \
+  --lotes REST-ORG-MULTI-001 GRPC-ORG-MULTI-001 NIFI-ORG-MULTI-001 \
+  --esperadas 3
+```
+
+El comparador agrupa por `lote_id` + `id_organizacion`. Compara `registro`,
+`estado_validacion`, `errores` y metadata común, ignorando únicamente
+`lote_id`. Detecta faltantes, extras, duplicados y diferencias de contenido.
+
+Los tres canales de Organización publican `{metadata, registro}`.
+Un mensaje plano queda `INVALIDO` con:
+
+```text
+se requiere envelope {metadata, registro}
+```
+
+---
+
+## Reglas deliberadamente fuera de alcance actual
+
+Todavía no se implementan:
+
+* valores permitidos de `c_organizacion`;
+* existencia en `organizacion_tipo`;
+* validación de jurisdicciones contra catálogo;
+* `fecha_baja >= fecha_alta`;
+* longitud o formato específico de `id_organizacion`;
+* unicidad global;
+* relaciones con establecimientos, grupos, `unidad_servicio` o localización;
+* `organizacion_agrupacion`, `agrupacion`, `componente_organizacional`,
+  `relacion_organizacional`;
+* validaciones contra padrón u otras fuentes externas.
+
+Esos puntos quedan pendientes de definición o de acceso con el cliente.
+No se documentan como confirmados.
+
+
+
+---
+---
+
+## Etapa 7 — Apache Spark + PostgreSQL DW / Processed
+
+Esta etapa extiende el laboratorio después de Bronze.
+
+El objetivo es validar:
+
+```text
+Apache Ozone / Bronze
+        ↓
+Apache Spark
+        ↓
+transformación batch
+        ↓
+PostgreSQL Data Warehouse
+        ↓
+schema processed
+```
+
+En esta etapa no se construye `Curated` ni Data Marts.
+
+La razón es deliberada: todavía no existen suficientes reglas de negocio
+confirmadas para deduplicar, integrar o reinterpretar los registros desde una
+perspectiva funcional.
+
+`Processed` realiza transformaciones técnicas y relacionales sin inventar
+semántica de negocio.
+
+---
+
+### 7.1 Arquitectura de la etapa
+
+```text
+REST / gRPC / NiFi
+        ↓
+      Kafka
+        ↓
+      Flink
+        ↓
+Apache Ozone / Bronze
+        ↓
+      Spark
+        ↓
+ PostgreSQL DW
+        ↓
+    processed
+    ├── persona
+    └── organizacion
+```
+
+Apache Spark procesa los datos.
+
+PostgreSQL almacena el resultado estructurado.
+
+Airflow todavía no interviene; actualmente los jobs Spark se ejecutan
+manualmente mediante `spark-submit`.
+
+---
+
+### 7.2 PostgreSQL Data Warehouse
+
+Servicio:
+
+```text
+postgres-dw
+```
+
+Imagen:
+
+```text
+postgres:17
+```
+
+Base:
+
+```text
+bnh_dw
+```
+
+Usuario LAB:
+
+```text
+bnh
+```
+
+Puerto:
+
+```text
+Host:      localhost:5433
+Docker:    postgres-dw:5432
+```
+
+El DW es independiente de cualquier futura base de metadata de Airflow.
+
+---
+
+### 7.3 Inicialización del DW
+
+Archivos versionados:
+
+```text
+docker/postgres-dw/init/
+├── 001_create_processed.sql
+├── 002_create_processed_persona.sql
+└── 003_create_processed_organizacion.sql
+```
+
+`001_create_processed.sql` crea:
+
+```sql
+CREATE SCHEMA IF NOT EXISTS processed;
+```
+
+Los scripts ubicados en:
+
+```text
+/docker-entrypoint-initdb.d
+```
+
+se ejecutan automáticamente solamente cuando PostgreSQL inicializa un volumen
+vacío.
+
+Por lo tanto:
+
+* **volumen nuevo:** los scripts se ejecutan automáticamente;
+* **volumen existente:** agregar un nuevo archivo SQL no modifica la base ya
+  inicializada.
+
+Para aplicar manualmente un script sobre un volumen existente:
+
+```bash
+docker exec -i bnh-postgres-dw \
+  psql -U bnh -d bnh_dw \
+  < docker/postgres-dw/init/<ARCHIVO>.sql
+```
+
+---
+
+### 7.4 Tabla `processed.persona`
+
+Definición versionada en:
+
+```text
+docker/postgres-dw/init/002_create_processed_persona.sql
+```
+
+Estructura:
+
+```sql
+CREATE TABLE IF NOT EXISTS processed.persona (
+    id_persona                  TEXT NOT NULL,
+    jurisdiccion                TEXT,
+    lote_id                     TEXT,
+    fecha_nacimiento            DATE,
+    cuit                        TEXT,
+    c_documento                 TEXT,
+    nro_documento               TEXT,
+    c_pais_nacimiento           TEXT,
+    c_provincia_nacimiento      TEXT,
+    c_departamento_nacimiento   TEXT,
+    c_localidad_nacimiento      TEXT,
+    c_municipio_nacimiento      TEXT,
+    lugar_nacimiento            TEXT,
+    c_fallecido                 TEXT,
+    fecha_fallecido             DATE,
+    c_es_indigena               TEXT,
+    processed_at                TIMESTAMP NOT NULL
+);
+```
+
+---
+
+### 7.5 Tabla `processed.organizacion`
+
+Definición versionada en:
+
+```text
+docker/postgres-dw/init/003_create_processed_organizacion.sql
+```
+
+Estructura:
+
+```sql
+CREATE TABLE IF NOT EXISTS processed.organizacion (
+    id_organizacion TEXT NOT NULL,
+    jurisdiccion    TEXT,
+    lote_id         TEXT,
+    nombre          TEXT NOT NULL,
+    descripcion     TEXT,
+    c_organizacion  TEXT NOT NULL,
+    fecha_alta      DATE NOT NULL,
+    fecha_baja      DATE,
+    processed_at    TIMESTAMP NOT NULL
+);
+```
+
+---
+
+### 7.6 Apache Spark
+
+El laboratorio utiliza:
+
+```text
+spark:4.1.2-python3
+```
+
+Topología:
+
+```text
+spark-master
+    │
+    └── spark-worker
+```
+
+Master:
+
+```text
+spark://spark-master:7077
+```
+
+UI:
+
+```text
+http://localhost:8082
+```
+
+El worker del LAB está limitado a:
+
+```text
+2 cores
+2 GB RAM
+```
+
+El objetivo es mantener una topología distribuida mínima que también pueda
+ejecutarse en una laptop de trabajo.
+
+Los jobs versionados se montan en el master:
+
+```text
+./apps/spark/jobs:/opt/spark/jobs:ro
+```
+
+---
+
+### 7.7 Validar ejecución distribuida de Spark
+
+Smoke de cálculo:
+
+```bash
+docker exec bnh-spark-master \
+  /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  /opt/spark/examples/src/main/python/pi.py \
+  10
+```
+
+Durante la prueba el master asignó un executor al worker y el job finalizó
+correctamente.
+
+El objetivo de esta prueba no es calcular Pi como funcionalidad del proyecto,
+sino demostrar:
+
+```text
+spark-submit
+    ↓
+Spark Master
+    ↓
+Spark Worker
+    ↓
+ejecución distribuida
+```
+
+---
+
+### 7.8 Dependencias para S3A
+
+Spark debe leer Bronze mediante:
+
+```text
+s3a://
+```
+
+La imagen base utilizada no incluye `hadoop-aws`.
+
+Spark 4.1.2 incluye Hadoop 3.4.2, por lo que en el laboratorio se utiliza:
+
+```text
+org.apache.hadoop:hadoop-aws:3.4.2
+```
+
+También se fija un directorio Ivy escribible:
+
+```text
+spark.jars.ivy=/tmp/ivy
+```
+
+porque el usuario de la imagen Spark no dispone de un home convencional
+escribible para el cache default.
+
+Actualmente las dependencias se resuelven dinámicamente con `--packages`.
+
+> Esto es aceptable para el laboratorio. Para una imagen productiva/reproducible
+> sin dependencia de Maven durante el arranque se deberá evaluar incorporarlas a
+> una imagen propia.
+
+---
+
+### 7.9 Configuración Spark → Ozone
+
+Parámetros utilizados:
+
+```text
+spark.hadoop.fs.s3a.endpoint=http://ozone-s3g:9878
+spark.hadoop.fs.s3a.endpoint.region=us-east-1
+spark.hadoop.fs.s3a.path.style.access=true
+spark.hadoop.fs.s3a.connection.ssl.enabled=false
+spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+```
+
+Las credenciales son únicamente de laboratorio.
+
+Flujo validado:
+
+```text
+Ozone
+  ↓
+S3 Gateway
+  ↓
+S3A
+  ↓
+Spark
+```
+
+---
+
+### 7.10 Driver PostgreSQL JDBC
+
+Para escribir el DW se utiliza:
+
+```text
+org.postgresql:postgresql:42.7.13
+```
+
+URL JDBC interna:
+
+```text
+jdbc:postgresql://postgres-dw:5432/bnh_dw
+```
+
+Los jobs actuales contienen configuración LAB explícita.
+
+> En producción las credenciales deberán externalizarse y gestionarse mediante
+> secretos. No deben quedar embebidas en jobs.
+
+---
+
+## Job Spark Persona
+
+Archivo:
+
+```text
+apps/spark/jobs/personas_processed.py
+```
+
+Origen:
+
+```text
+s3a://bnh-bronze/personas/*/part-*
+```
+
+Destino:
+
+```text
+processed.persona
+```
+
+### 7.11 Selección de candidatos
+
+Un registro es candidato cuando:
+
+```text
+estado_validacion = VALIDO
+metadata.dominio = persona
+registro.id_persona != null
+```
+
+Esto evita promover directamente registros `INVALIDO` hacia Processed.
+
+---
+
+### 7.12 Tipado defensivo
+
+Spark convierte:
+
+```text
+registro.fecha_nacimiento → DATE
+registro.fecha_fallecido  → DATE
+```
+
+utilizando:
+
+```sql
+try_cast(... AS DATE)
+```
+
+Un registro se considera técnicamente apto cuando:
+
+* `fecha_nacimiento` puede convertirse a `DATE`;
+* si `fecha_fallecido` viene informada, también puede convertirse a `DATE`.
+
+Si no se puede tipar, el registro permanece preservado en Bronze pero no se
+promociona al DW.
+
+Esto no significa que Spark reimplemente todas las reglas de Flink.
+
+Es una barrera técnica para garantizar que el modelo relacional pueda almacenar
+el registro.
+
+Durante una prueba con datos Bronze históricos se detectaron:
+
+```text
+Candidatos: 40
+Descartados por tipado: 2
+Processed: 38
+```
+
+Los dos descartados contenían:
+
+```text
+fecha_fallecido = 2025-99-99
+```
+
+aunque estaban marcados como `VALIDO` por una versión anterior del flujo.
+
+Este caso justificó mantener el tipado defensivo en la capa Processed.
+
+---
+
+### 7.13 Transformación Persona
+
+Spark aplana:
+
+```text
+metadata.jurisdiccion → jurisdiccion
+metadata.lote_id      → lote_id
+registro.*            → columnas relacionales
+```
+
+y agrega:
+
+```text
+processed_at
+```
+
+Ejemplo conceptual:
+
+```text
+Bronze
+
+{
+  "metadata": {
+    "jurisdiccion": "ARG-B",
+    "lote_id": "LOTE-001"
+  },
+  "registro": {
+    "id_persona": "P000001",
+    "fecha_nacimiento": "1990-05-10"
+  }
+}
+
+             ↓ Spark
+
+Processed
+
+id_persona | jurisdiccion | lote_id  | fecha_nacimiento
+P000001    | ARG-B        | LOTE-001 | 1990-05-10
+```
+
+---
+
+### 7.14 Ejecutar Persona Bronze → Processed
+
+```bash
+docker exec bnh-spark-master \
+  /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --conf spark.jars.ivy=/tmp/ivy \
+  --packages org.apache.hadoop:hadoop-aws:3.4.2,org.postgresql:postgresql:42.7.13 \
+  --conf spark.hadoop.fs.s3a.endpoint=http://ozone-s3g:9878 \
+  --conf spark.hadoop.fs.s3a.endpoint.region=us-east-1 \
+  --conf spark.hadoop.fs.s3a.access.key=bnhadmin \
+  --conf spark.hadoop.fs.s3a.secret.key=bnh-lab-secret \
+  --conf spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider \
+  --conf spark.hadoop.fs.s3a.path.style.access=true \
+  --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
+  /opt/spark/jobs/personas_processed.py
+```
+
+Buscar en la salida:
+
+```text
+Candidatos: ...
+Descartados por tipado: ...
+Processed: ...
+Carga PostgreSQL completada
+```
+
+No debería finalizar con `Traceback`.
+
+En la validación actual sobre Ozone se obtuvo:
+
+```text
+Candidatos: 3
+Descartados por tipado: 0
+Processed: 3
+Carga PostgreSQL completada
+```
+
+---
+
+### 7.15 Verificar Persona en PostgreSQL
+
+```bash
+docker exec bnh-postgres-dw \
+  psql -U bnh -d bnh_dw \
+  -c "SELECT id_persona, jurisdiccion, lote_id, fecha_nacimiento, processed_at FROM processed.persona ORDER BY id_persona;"
+```
+
+Validación observada:
+
+```text
+OZONE-P000001 | ARG-B | OZONE-REST-PER-001
+P000001       | ARG-B | REST-PERSONA-SMOKE-ORG
+P000001       | ARG-B | GRPC-PERSONA-SMOKE-ORG
+```
+
+La repetición de `id_persona` no se elimina en Processed.
+
+Cada fila puede corresponder a diferentes lotes/eventos Bronze.
+
+No existe todavía una regla funcional confirmada para elegir una única versión.
+
+---
+
+## Job Spark Organización
+
+Archivo:
+
+```text
+apps/spark/jobs/organizaciones_processed.py
+```
+
+Origen:
+
+```text
+s3a://bnh-bronze/organizaciones/*/part-*
+```
+
+Destino:
+
+```text
+processed.organizacion
+```
+
+---
+
+### 7.16 Selección y tipado de Organización
+
+Candidatos:
+
+```text
+estado_validacion = VALIDO
+metadata.dominio = organizacion
+registro.id_organizacion != null
+```
+
+Se convierten:
+
+```text
+fecha_alta → DATE
+fecha_baja → DATE
+```
+
+`fecha_alta` debe ser tipable.
+
+Si `fecha_baja` está informada, también debe ser tipable.
+
+---
+
+### 7.17 Ejecutar Organización Bronze → Processed
+
+```bash
+docker exec bnh-spark-master \
+  /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --conf spark.jars.ivy=/tmp/ivy \
+  --packages org.apache.hadoop:hadoop-aws:3.4.2,org.postgresql:postgresql:42.7.13 \
+  --conf spark.hadoop.fs.s3a.endpoint=http://ozone-s3g:9878 \
+  --conf spark.hadoop.fs.s3a.endpoint.region=us-east-1 \
+  --conf spark.hadoop.fs.s3a.access.key=bnhadmin \
+  --conf spark.hadoop.fs.s3a.secret.key=bnh-lab-secret \
+  --conf spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider \
+  --conf spark.hadoop.fs.s3a.path.style.access=true \
+  --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
+  /opt/spark/jobs/organizaciones_processed.py
+```
+
+Validación actual:
+
+```text
+Candidatos: 1
+Descartados por tipado: 0
+Processed: 1
+Carga PostgreSQL completada
+```
+
+---
+
+### 7.18 Verificar Organización en PostgreSQL
+
+```bash
+docker exec bnh-postgres-dw \
+  psql -U bnh -d bnh_dw \
+  -c "SELECT id_organizacion, jurisdiccion, lote_id, nombre, c_organizacion, fecha_alta, fecha_baja, processed_at FROM processed.organizacion;"
+```
+
+Fila validada:
+
+```text
+OZONE-ORG-0001
+ARG-B
+OZONE-REST-ORG-001
+Organizacion Ozone Test
+01
+2020-01-15
+```
+
+---
+
+### 7.19 Estrategia de escritura actual
+
+Los jobs utilizan:
+
+```text
+mode("overwrite")
+truncate = true
+```
+
+El objetivo del LAB es que una reejecución reconstruya la tabla Processed desde
+el Bronze disponible y no duplique filas simplemente por volver a ejecutar el
+mismo job.
+
+Conceptualmente:
+
+```text
+Bronze actual
+    ↓
+Spark
+    ↓
+reconstrucción técnica
+    ↓
+Processed actual
+```
+
+Esta estrategia es simple y determinista para el laboratorio.
+
+No es todavía una estrategia incremental de producción.
+
+Pendiente para una plataforma operacional:
+
+* identificar nuevos objetos/lotes;
+* controlar reejecuciones parciales;
+* definir idempotencia;
+* definir upsert/merge;
+* versionado de contratos;
+* tratamiento de correcciones;
+* recuperación ante fallas de carga.
+
+---
+
+### 7.20 Qué NO hace Processed
+
+Actualmente no:
+
+* deduplica Personas u Organizaciones;
+* decide cuál registro prevalece;
+* cruza catálogos oficiales;
+* resuelve relaciones organizacionales;
+* integra fuentes externas;
+* aplica reglas educativas;
+* construye `Curated`;
+* construye Data Marts.
+
+Esas capacidades requieren reglas funcionales y criterios de negocio
+confirmados.
+
+---
+
+### 7.21 Validación completa del flujo actual
+
+Persona:
+
+```text
+REST/gRPC/NiFi
+      ↓
+Kafka
+      ↓
+Flink
+      ↓
+Ozone Bronze
+      ↓
+Spark
+      ↓
+processed.persona
+      ↓
+PostgreSQL
+      ✅
+```
+
+Organización:
+
+```text
+REST/gRPC/NiFi
+      ↓
+Kafka
+      ↓
+Flink
+      ↓
+Ozone Bronze
+      ↓
+Spark
+      ↓
+processed.organizacion
+      ↓
+PostgreSQL
+      ✅
+```
+
+---
+
+### 7.22 Inspección con DBeaver
+
+Conexión al DW desde el host:
+
+```text
+Host: localhost
+Port: 5433
+Database: bnh_dw
+User: bnh
+```
+
+El password es el configurado para el laboratorio en `compose.yaml`.
+
+Una vez conectado debería verse:
+
+```text
+bnh_dw
+└── Schemas
+    └── processed
+        ├── persona
+        └── organizacion
+```
+
+DBeaver es únicamente una herramienta de inspección/consulta. No forma parte del
+pipeline de procesamiento.
+
+---
+
+### 7.23 Troubleshooting Spark
+
+#### `UNABLE_TO_INFER_SCHEMA`
+
+Síntoma:
+
+```text
+Unable to infer schema for JSON
+```
+
+Bronze organiza archivos dentro de directorios fecha/hora.
+
+Usar:
+
+```text
+s3a://bnh-bronze/personas/*/part-*
+```
+
+en lugar de apuntar solamente al directorio raíz.
+
+---
+
+#### `CANNOT_PARSE_TIMESTAMP`
+
+Síntoma:
+
+```text
+Text '2025-99-99' could not be parsed
+```
+
+No utilizar conversiones estrictas directamente sobre datos históricos.
+
+Los jobs actuales usan:
+
+```text
+try_cast(... AS DATE)
+```
+
+y filtran los registros no tipables antes de escribir Processed.
+
+---
+
+#### Error de Ivy en directorio `/nonexistent`
+
+Síntoma:
+
+```text
+FileNotFoundException
+/nonexistent/.ivy...
+```
+
+Usar:
+
+```text
+--conf spark.jars.ivy=/tmp/ivy
+```
+
+---
+
+#### Spark no encuentra `hadoop-aws`
+
+Agregar:
+
+```text
+--packages org.apache.hadoop:hadoop-aws:3.4.2
+```
+
+---
+
+#### Spark no encuentra el driver PostgreSQL
+
+Agregar:
+
+```text
+--packages org.postgresql:postgresql:42.7.13
+```
+
+junto con `hadoop-aws`.
+
+---
+
+#### Spark está detenido
+
+Levantar:
+
+```bash
+docker compose up -d spark-master spark-worker
+```
+
+---
+
+#### PostgreSQL está detenido
+
+Levantar:
+
+```bash
+docker compose up -d postgres-dw
+```
+
+---
+
+### 7.24 Estado del laboratorio al cierre de esta etapa
+
+Confirmado:
+
+* Kafka 4.3.0 operativo.
+* REST, gRPC y NiFi como canales de ingesta.
+* Persona y Organización convergen en Kafka/Bronze.
+* Flink 2.1.1 normaliza y valida.
+* Apache Ozone 2.2.1 es el storage Bronze activo.
+* S3 Gateway validado.
+* Bronze Persona y Organización validado.
+* Spark 4.1.2 master/worker validado.
+* Spark lee Ozone mediante S3A.
+* `processed.persona` validado.
+* `processed.organizacion` validado.
+* PostgreSQL 17 funciona como DW del laboratorio.
+* reconstrucción de tablas Processed mediante Spark validada.
+
+Pendiente inmediato:
+
+```text
+Apache Airflow
+```
+
+Objetivo de la siguiente etapa:
+
+```text
+Airflow
+   ↓
+orquestar jobs Spark
+   ↓
+Ozone Bronze → Processed
+```
+
+Airflow deberá utilizar una base PostgreSQL de metadata separada del Data
+Warehouse.
+
+---
+

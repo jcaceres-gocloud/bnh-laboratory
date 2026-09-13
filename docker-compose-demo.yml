@@ -1,0 +1,310 @@
+x-ozone-common: &ozone-common
+  image: apache/ozone:2.2.1-slim
+  environment: &ozone-environment
+    OZONE-SITE.XML_hdds.datanode.dir: /data/hdds
+    OZONE-SITE.XML_ozone.metadata.dirs: /data/metadata
+    OZONE-SITE.XML_ozone.om.address: ozone-om
+    OZONE-SITE.XML_ozone.om.http-address: ozone-om:9874
+    OZONE-SITE.XML_ozone.replication: "1"
+    OZONE-SITE.XML_hdds.scm.safemode.min.datanode: "1"
+    OZONE-SITE.XML_ozone.scm.block.client.address: ozone-scm
+    OZONE-SITE.XML_ozone.scm.client.address: ozone-scm
+    OZONE-SITE.XML_ozone.scm.datanode.id.dir: /data/metadata
+    OZONE-SITE.XML_ozone.scm.names: ozone-scm
+    no_proxy: ozone-om,ozone-scm,ozone-s3g,localhost,127.0.0.1
+
+services:
+  kafka:
+    image: apache/kafka:4.3.0
+    container_name: bnh-demo-kafka
+    hostname: kafka
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 || exit 1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+    ports:
+      - "9092:9092"
+
+    environment:
+      KAFKA_NODE_ID: 1
+
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: >
+        CONTROLLER:PLAINTEXT,
+        INTERNAL:PLAINTEXT,
+        EXTERNAL:PLAINTEXT
+
+      KAFKA_LISTENERS: >
+        CONTROLLER://:29093,
+        INTERNAL://:19092,
+        EXTERNAL://:9092
+
+      KAFKA_ADVERTISED_LISTENERS: >
+        INTERNAL://kafka:19092,
+        EXTERNAL://localhost:9092
+
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      KAFKA_CONTROLLER_QUORUM_VOTERS: >
+        1@kafka:29093
+
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+  api:
+    build:
+      context: ./apps/api
+    container_name: bnh-demo-api
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+    ports:
+      - "8000:8000"
+
+    restart: "no"
+
+  nifi:
+    image: apache/nifi:2.11.0
+    container_name: bnh-demo-nifi
+    hostname: nifi
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+    ports:
+      - "8443:8443"
+
+    environment:
+      SINGLE_USER_CREDENTIALS_USERNAME: admin
+      SINGLE_USER_CREDENTIALS_PASSWORD: BnhLaboratory1234
+    
+    volumes:
+      - ./data/incoming:/data/incoming
+      - nifi_conf:/opt/nifi/nifi-current/conf
+      - nifi_state:/opt/nifi/nifi-current/state
+      - nifi_database:/opt/nifi/nifi-current/database_repository
+      - nifi_flowfile:/opt/nifi/nifi-current/flowfile_repository
+      - nifi_content:/opt/nifi/nifi-current/content_repository
+      - nifi_provenance:/opt/nifi/nifi-current/provenance_repository
+
+    restart: "no"
+
+  grpc-server:
+    build:
+      context: ./apps/grpc
+      dockerfile: server/Dockerfile
+    container_name: bnh-demo-grpc-server
+    hostname: grpc-server
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+    ports:
+      - "50051:50051"
+      - "8001:8001"
+
+    restart: "no"
+
+  flink-jobmanager:
+    build:
+      context: ./apps/flink
+      dockerfile: Dockerfile
+    image: bnh-flink:2.1.1
+    container_name: bnh-demo-flink-jobmanager
+    hostname: flink-jobmanager
+    command: jobmanager
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./apps/flink/jobs:/opt/flink/jobs:ro
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        s3.endpoint: http://ozone-s3g:9878
+        s3.access-key: bnhadmin
+        s3.secret-key: BnhMinioLaboratory1234
+        s3.path.style.access: true
+    restart: "no"
+
+  flink-taskmanager:
+    build:
+      context: ./apps/flink
+      dockerfile: Dockerfile
+    image: bnh-flink:2.1.1
+    container_name: bnh-demo-flink-taskmanager
+    hostname: flink-taskmanager
+    command: taskmanager
+    depends_on:
+      flink-jobmanager:
+        condition: service_started
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+        s3.endpoint: http://ozone-s3g:9878
+        s3.access-key: bnhadmin
+        s3.secret-key: BnhMinioLaboratory1234
+        s3.path.style.access: true
+    restart: "no"
+
+  ozone-scm:
+    <<: *ozone-common
+    container_name: bnh-demo-ozone-scm
+    hostname: ozone-scm
+    command: ["ozone", "scm"]
+    environment:
+      <<: *ozone-environment
+      ENSURE_SCM_INITIALIZED: /data/metadata/scm/current/VERSION
+    volumes:
+      - ozone_scm_data:/data
+    ports:
+      - "9876:9876"
+    restart: "no"
+
+  ozone-om:
+    <<: *ozone-common
+    container_name: bnh-demo-ozone-om
+    hostname: ozone-om
+    command: ["ozone", "om"]
+    environment:
+      <<: *ozone-environment
+      ENSURE_OM_INITIALIZED: /data/metadata/om/current/VERSION
+      WAITFOR: ozone-scm:9876
+      CORE-SITE.XML_hadoop.proxyuser.hadoop.hosts: "*"
+      CORE-SITE.XML_hadoop.proxyuser.hadoop.groups: "*"
+    volumes:
+      - ozone_om_data:/data
+    depends_on:
+      - ozone-scm
+    ports:
+      - "9874:9874"
+    restart: "no"
+
+  ozone-datanode:
+    <<: *ozone-common
+    container_name: bnh-demo-ozone-datanode
+    hostname: ozone-datanode
+    command: ["ozone", "datanode"]
+    volumes:
+      - ozone_datanode_data:/data
+    depends_on:
+      - ozone-scm
+      - ozone-om
+    restart: "no"
+
+  ozone-s3g:
+    <<: *ozone-common
+    container_name: bnh-demo-ozone-s3g
+    hostname: ozone-s3g
+    command: ["ozone", "s3g"]
+    depends_on:
+      - ozone-scm
+      - ozone-om
+      - ozone-datanode
+    ports:
+      - "9878:9878"
+    restart: "no"
+
+  ozone-init:
+    <<: *ozone-common
+    container_name: bnh-demo-ozone-init
+    hostname: ozone-init
+    depends_on:
+      - ozone-om
+      - ozone-scm
+      - ozone-datanode
+    environment:
+      <<: *ozone-environment
+      WAITFOR: ozone-om:9874
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        until ozone sh volume list >/dev/null 2>&1; do
+          sleep 1
+        done
+        ozone sh volume info /s3v >/dev/null 2>&1 || ozone sh volume create /s3v
+        ozone sh bucket info /s3v/bnh-bronze >/dev/null 2>&1 || ozone sh bucket create --layout OBJECT_STORE /s3v/bnh-bronze
+    restart: "no"
+
+
+  s3webui:
+    image: ghcr.io/wenisch-tech/s3webui:latest
+    container_name: bnh-demo-s3webui
+
+    depends_on:
+      ozone-init:
+        condition: service_completed_successfully
+
+    ports:
+      - "8083:8080"
+
+    user: "0:0"
+
+    environment:
+      ADMIN_EMAIL: admin@bnh.local
+      ADMIN_PASSWORD: BnhLaboratory1234
+      S3_ACCESS_KEY: bnhadmin
+      S3_SECRET_KEY: BnhMinioLaboratory1234
+      S3_ENDPOINT_URL: http://ozone-s3g:9878
+      S3_REGION: us-east-1
+
+    volumes:
+      - s3webui_data:/app/data
+
+    restart: "no"
+
+  portainer:
+    image: portainer/portainer-ce:2.45.0
+    container_name: bnh-demo-portainer
+
+    ports:
+      - "9443:9443"
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+
+    restart: "no"
+
+volumes:
+  kafka_data:
+  nifi_conf:
+  nifi_state:
+  nifi_database:
+  nifi_flowfile:
+  nifi_content:
+  nifi_provenance:
+  ozone_scm_data:
+  ozone_om_data:
+  ozone_datanode_data:
+  s3webui_data:
+  portainer_data:
