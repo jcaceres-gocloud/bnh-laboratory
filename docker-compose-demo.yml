@@ -132,6 +132,23 @@ services:
 
     restart: "no"
 
+  grpc-client:
+    build:
+      context: ./apps/grpc
+      dockerfile: client/Dockerfile
+    container_name: bnh-grpc-client
+
+    depends_on:
+      - grpc-server
+
+    environment:
+      TOTAL_PERSONAS: ${TOTAL_PERSONAS:-10}
+      TOTAL_ORGANIZACIONES: ${TOTAL_ORGANIZACIONES:-10}
+      GRPC_CASE: ${GRPC_CASE:-valid}
+      LOTE_ID: ${LOTE_ID:-}
+
+    restart: "no"
+
   flink-jobmanager:
     build:
       context: ./apps/flink
@@ -255,7 +272,7 @@ services:
         ozone sh bucket info /s3v/bnh-bronze >/dev/null 2>&1 || ozone sh bucket create --layout OBJECT_STORE /s3v/bnh-bronze
     restart: "no"
 
-
+# OBSERVABILIDAD
   s3webui:
     image: ghcr.io/wenisch-tech/s3webui:latest
     container_name: bnh-demo-s3webui
@@ -295,6 +312,93 @@ services:
 
     restart: "no"
 
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: bnh-demo-kafka-ui
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+    ports:
+      - "8084:8080"
+
+    environment:
+      KAFKA_CLUSTERS_0_NAME: BNH
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+    restart: "no"
+
+
+# PLATA
+  postgres-dw:
+    image: postgres:17
+    container_name: bnh-postgres-dw
+    hostname: postgres-dw
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U bnh -d bnh_dw",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+    ports:
+      - "5433:5432"
+
+    environment:
+      POSTGRES_DB: bnh_dw
+      POSTGRES_USER: bnh
+      POSTGRES_PASSWORD: BnhLaboratory1234
+
+    volumes:
+      - postgres_dw_data:/var/lib/postgresql/data
+      - ./docker/postgres-dw/init:/docker-entrypoint-initdb.d:ro
+
+    restart: "no"
+
+  spark-master:
+    image: spark:4.1.2-python3
+    container_name: bnh-spark-master
+    hostname: spark-master
+
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+
+    ports:
+      - "7077:7077"
+      - "8082:8080"
+
+    restart: "no"
+    volumes:
+      - ./apps/spark/jobs:/opt/spark/jobs:ro
+
+  spark-worker:
+    image: spark:4.1.2-python3
+    container_name: bnh-spark-worker
+    hostname: spark-worker
+
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2g
+
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+
+    depends_on:
+      - spark-master
+
+    restart: "no"
+
+
 volumes:
   kafka_data:
   nifi_conf:
@@ -308,3 +412,6 @@ volumes:
   ozone_datanode_data:
   s3webui_data:
   portainer_data:
+  postgres_dw_data:
+  spark_master_data:
+  spark_worker_data:
