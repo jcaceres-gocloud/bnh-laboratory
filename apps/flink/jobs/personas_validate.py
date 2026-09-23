@@ -244,7 +244,12 @@ def main():
     from pyflink.common.serialization import Encoder, SimpleStringSchema
     from pyflink.common.watermark_strategy import WatermarkStrategy
     from pyflink.datastream import StreamExecutionEnvironment
-    from pyflink.datastream.connectors.file_system import FileSink, RollingPolicy
+    from pyflink.datastream.connectors.file_system import (
+        BucketAssigner,
+        FileSink,
+        RollingPolicy,
+    )
+    from pyflink.java_gateway import get_gateway
     from pyflink.datastream.connectors.kafka import (
         KafkaOffsetsInitializer,
         KafkaSource,
@@ -275,11 +280,22 @@ def main():
         output_type=Types.STRING(),
     )
 
+    gateway = get_gateway()
+
+    j_jurisdiccion_assigner = (
+        gateway.jvm
+        .ar.gob.bnh.flink.bucket
+        .JurisdiccionBucketAssigner()
+    )
+
+    jurisdiccion_assigner = BucketAssigner(j_jurisdiccion_assigner)
+
     bronze_sink = (
         FileSink.for_row_format(
             "s3://bnh-bronze/personas/",
             Encoder.simple_string_encoder(),
         )
+        .with_bucket_assigner(jurisdiccion_assigner)
         .with_rolling_policy(
             RollingPolicy.default_rolling_policy(
                 part_size=64 * 1024 * 1024,
