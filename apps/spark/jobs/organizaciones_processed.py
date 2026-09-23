@@ -12,6 +12,25 @@ spark = (
     .getOrCreate()
 )
 
+
+def bronze_has_files(spark, path_pattern: str) -> bool:
+    hadoop_conf = spark._jsc.hadoopConfiguration()
+    path = spark._jvm.org.apache.hadoop.fs.Path(path_pattern)
+    filesystem = path.getFileSystem(hadoop_conf)
+
+    matches = filesystem.globStatus(path)
+
+    return matches is not None and len(matches) > 0
+
+
+if not bronze_has_files(spark, BRONZE_PATH):
+    print("Candidatos: 0")
+    print("Descartados por tipado: 0")
+    print("Processed: 0")
+    print("No hay archivos Bronze de Organizaciones para procesar.")
+    spark.stop()
+    raise SystemExit(0)
+
 bronze = spark.read.json(BRONZE_PATH)
 
 candidatos = (

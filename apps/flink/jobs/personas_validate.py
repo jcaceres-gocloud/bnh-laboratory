@@ -244,7 +244,7 @@ def main():
     from pyflink.common.serialization import Encoder, SimpleStringSchema
     from pyflink.common.watermark_strategy import WatermarkStrategy
     from pyflink.datastream import StreamExecutionEnvironment
-    from pyflink.datastream.connectors.file_system import FileSink
+    from pyflink.datastream.connectors.file_system import FileSink, RollingPolicy
     from pyflink.datastream.connectors.kafka import (
         KafkaOffsetsInitializer,
         KafkaSource,
@@ -275,10 +275,21 @@ def main():
         output_type=Types.STRING(),
     )
 
-    bronze_sink = FileSink.for_row_format(
-        "s3://bnh-bronze/personas/",
-        Encoder.simple_string_encoder(),
-    ).build()
+    bronze_sink = (
+        FileSink.for_row_format(
+            "s3://bnh-bronze/personas/",
+            Encoder.simple_string_encoder(),
+        )
+        .with_rolling_policy(
+            RollingPolicy.default_rolling_policy(
+                part_size=64 * 1024 * 1024,
+                rollover_interval=30 * 1000,
+                inactivity_interval=5 * 1000,
+            ),
+        )
+        .with_bucket_check_interval(1000)
+        .build()
+    )
 
     validadas.sink_to(bronze_sink)
     validadas.print()

@@ -133,9 +133,12 @@ services:
     restart: "no"
 
   grpc-client:
+    profiles:
+      - manual
     build:
       context: ./apps/grpc
       dockerfile: client/Dockerfile
+
     container_name: bnh-grpc-client
 
     depends_on:
@@ -299,19 +302,6 @@ services:
 
     restart: "no"
 
-  portainer:
-    image: portainer/portainer-ce:2.45.0
-    container_name: bnh-demo-portainer
-
-    ports:
-      - "9443:9443"
-
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - portainer_data:/data
-
-    restart: "no"
-
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: bnh-demo-kafka-ui
@@ -411,7 +401,6 @@ volumes:
   ozone_om_data:
   ozone_datanode_data:
   s3webui_data:
-  portainer_data:
   postgres_dw_data:
   spark_master_data:
   spark_worker_data:
